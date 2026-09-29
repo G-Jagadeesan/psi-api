@@ -148,13 +148,33 @@ export async function runReport(options: RunnerOptions): Promise<RunnerResult> {
   });
   aggregated = applyTargets(aggregated, targets ?? loadTargets());
 
+  // PSI caches per-URL, so N runs of one URL can collapse into a single cached
+  // report repeated N times. The median would then be one sample wearing 10 hats.
+  const runWarnings = [...warnings];
+  if (ordered.length > 1) {
+    const stamps = new Set(ordered.map((report) => report.fetchTime));
+    if (stamps.size === 1) {
+      runWarnings.push(
+        `All ${ordered.length} runs returned the same analysis timestamp, so PSI served one ` +
+          'cached report instead of re-measuring. The median and stddev here are not ' +
+          'independent samples and must not be used to judge a change. Re-run after the ' +
+          'PSI cache expires, or check that the cache-busting param is reaching the target URL.',
+      );
+    } else if (stamps.size < ordered.length) {
+      runWarnings.push(
+        `Only ${stamps.size} distinct measurements across ${ordered.length} runs - some runs ` +
+          'were served from the PSI cache.',
+      );
+    }
+  }
+
   let dir: string | undefined;
   if (save) {
     const saved = await saveReport(aggregated, ordered, dataDir);
     dir = saved.dir;
   }
 
-  const result: RunnerResult = { report: aggregated, runs: ordered, warnings };
+  const result: RunnerResult = { report: aggregated, runs: ordered, warnings: runWarnings };
   if (dir) result.dir = dir;
   return result;
 }

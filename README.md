@@ -143,6 +143,7 @@ Filters a stored report. Every parameter is optional and they all combine.
 | `hasItems` | `true` = only audits carrying a `details.items` list. |
 | `sortBy` | `savingsMs` (default), `savingsBytes`, `score`. |
 | `order` | `desc` (default) or `asc`. |
+| `party` | `any` (default), `first`, `third`. See below. |
 | `limit` | Max results. |
 | `includeFlaky` | `true` (default). `false` hides insights seen in <30% of runs. |
 
@@ -216,6 +217,7 @@ Runs the same core code as the server, so no server is needed.
 | `--hasItems` / `--noItems` | — | Require / forbid a details item list. |
 | `--sortBy <savingsMs\|savingsBytes\|score>` | `savingsMs` | |
 | `--order <asc\|desc>` | `desc` | |
+| `--party <any\|first\|third>` | `any` | Whose cost counts. See below. |
 | `--limit <n>` | — | |
 | `--noFlaky` | — | Hide insights seen in <30% of runs. |
 | `--json` | off | Machine-readable output. |
@@ -231,6 +233,8 @@ npm run psi -- --reportId 2026-09-29T10-30-00Z-mobile --metric tbt --noFlaky
 ```
 
 Filters compose with `--reportId`, so narrowing a work queue after a 10-run baseline never costs another quota unit.
+
+**Use `--party first` when building a work queue.** Without it the top of a savings sort is frequently third-party code you cannot fix in the repo.
 
 Exit code is `0` on success, `1` on error — so `npm run --silent psi -- <url> --runs 3 || echo "failed"` works in a script.
 
@@ -261,6 +265,95 @@ Every metric and the score are reported with all three statistics plus the raw v
 - **`mode`** is the most frequently observed bucket. Read it as "what this page typically scores", not as a precise figure.
 - **`stddev` is the sample standard deviation (n−1)** and doubles as the noise band: an improvement smaller than roughly one `stddev` is not distinguishable from run-to-run variance.
 - Runs execute with bounded concurrency (`PSI_CONCURRENCY`, default 2). Some runs may fail; the run continues and the result reports `runsRequested` vs `runsSucceeded`. **If fewer than 60% of runs succeed the whole call fails** with `INSUFFICIENT_RUNS` rather than reporting a misleading number.
+
+### PSI caches per URL
+
+**The single most important thing to know about multi-run measurement.** PSI caches results per URL: asking for the same URL twice in a row returns *one* Lighthouse run, not two. Measured directly against the live API — five back-to-back calls returned one identical `analysisUTCTimestamp`.
+
+Left alone, `runs=10` silently becomes *one* measurement counted ten times. `stddev` comes out `0.0`, every value is identical, and the median is a single sample wearing ten hats. That defeats the entire reason this tool exists.
+
+So every run requests a unique param on the target URL:
+
+```
+https://example.com/          <- the report records this
+https://example.com/?psi_nonce=k3f9a2   <- what is actually requested
+```
+
+- `report.url` and the `data/<host>/` path stay clean; only the wire request carries the nonce.
+- A single fixed nonce would not help — the cache is keyed on the whole URL, so the value has to differ per run.
+- Pass `cacheBust: false` to `runPsiCall` to disable it, e.g. if a site rejects unknown query parameters.
+
+**The tool also checks.** After a report it compares the upstream analysis timestamps and warns if the runs collapsed:
+
+```
+warning: All 10 runs returned the same analysis timestamp, so PSI served one cached
+report instead of re-measuring. The median and stddev here are not independent
+samples and must not be used to judge a change.
+```
+
+#### `stddev: 0.0` is not always a bug
+
+Two different things produce zero variance, and they mean opposite things:
+
+| Cause | What you see | Meaning |
+| --- | --- | --- |
+| **PSI cache** (fixed) | Identical *metric values*, and the cache warning fires | The measurement is fake. Do not trust it. |
+| **A pinned page** | Identical scores, but metrics wobble slightly | Real. A page far inside the "good" band — or scoring 100 — legitimately scores the same every time. |
+
+`https://example.com/` returns `stddev 0.0` for a legitimate reason: it is so far above the thresholds that every run rounds to 100. Its LCP still moves (754 / 771 / 783 ms across three runs). **Check the metrics and the warning, not just the score, before concluding anything.**
+
+### First-party vs third party
+
+Sorting by savings alone will send you after other people's code. On a real deployment of this project the top actionable findings by estimated saving were **both `static.cloudflareinsights.com`** — Cloudflare's own analytics beacon on Cloudflare's own hosting. No amount of editing the app source fixes either one, and they outrank every genuine finding.
+
+So every insight now carries ownership:
+
+```json
+{
+  "id": "cache-insight",
+  "savingsMs": 150,
+  "firstPartyItems": 0,
+  "thirdPartyItems": 1,
+  "itemHosts": ["static.cloudflareinsights.com"]
+}
+```
+
+Hosts come from `items[].url` and nested `items[].subItems.items[].url`. A host is **first party** if it equals the measured domain or is a subdomain of it — `media.example.com` counts as yours when you measured `www.example.com`, because you own the fix even though the bytes cross a CDN.
+
+Use it as a filter:
+
+```bash
+# the work queue: only what editing this repo could plausibly fix
+npm run psi -- <url> --group opportunity,diagnostic --maxScore 0.9 --party first
+
+# what the tag managers are costing you, kept out of the queue above
+npm run psi -- <url> --party third
+```
+
+- `party=first` drops any insight charged to a foreign host. It **keeps** insights whose cost could not be attributed to a URL at all — main-thread breakdowns, LCP phase breakdowns. Those are usually your own JavaScript, and hiding them would hide the largest category of real work.
+- `party=third` is the inverse, for auditing third-party cost deliberately.
+- An item loading from both your CDN and a vendor counts as first party: you own part of the cost and part of the fix.
+
+`third-parties-insight` is treated as third party by definition, since every row in it is someone else's code.
+
+### "No estimate" is not "zero"
+
+`savingsMs` and `savingsBytes` are always present, and are `null` when Lighthouse gave no estimate. They used to be `0` or absent, interchangeably, which conflated two different facts:
+
+- `0` — this audit says the gain is nothing.
+- `null` — this audit does not say. Common for checklist-style insights.
+
+The distinction matters when choosing what to work on. `lcp-discovery-insight` reports a real failure (`fetchpriority=high` missing) with no time estimate; reported as `0` it sorted to the bottom of every work queue, indistinguishable from a genuinely worthless audit. It now sorts last *as unknown*, and can be surfaced deliberately:
+
+```bash
+npm run psi -- <url> --group diagnostic --maxScore 0.9 --sortBy score --order asc
+```
+
+Byte savings are rounded to whole bytes, and `itemsTotal` is always reported — previously it only appeared when more than 25 items were trimmed, so the row count was unanswerable for every smaller insight.
+
+### The cache-busting param never appears in output
+
+Runs are cache-busted with a unique `?psi_nonce=…` (see below), and Lighthouse echoes the URL it was given back in several places — including `lighthouseResult.finalUrl`, item URLs, third-party iframe fragments, and CrUX `initial_url`. All of it is stripped before anything is reported, so a saved report never claims the site was loaded with a parameter it never saw in production.
 
 ### Mode bucketing rules
 
@@ -373,7 +466,7 @@ The public `guvi-guvi` SOP sets the real bar: **Lighthouse 90+ minimum, 95+ best
 ## Development
 
 ```bash
-npm test          # 150 unit tests, no network
+npm test          # 173 unit tests, no network
 npm run typecheck # tsc over src and tests
 npm run dev       # watch mode
 npm run build     # emit dist/
@@ -395,6 +488,8 @@ To regenerate the fixture: `node scripts/make-fixture.js`.
 | Score `0` with a tiny `fetchTime` | The URL is `localhost`/private, so Lighthouse measured an error page. | Measure a deployed public URL. The tool warns about this up front. |
 | Report takes minutes | Each run is a real PSI call; 10 runs at concurrency 2 takes a while. | Use `?async=true`, or `runs=3` while iterating. |
 | Every insight shows `-` savings | Unexpected for Lighthouse 10.4+; those versions report `metricSavings`. | Should not happen — `metricSavings` is read as a fallback. If it does, the response shape has changed and the tool needs a look. |
+| `stddev 0.0`, every value identical | Either PSI served one cached report for all runs, or the page is pinned well inside the "good" band. | Read the warnings. If it says "same analysis timestamp", the runs were cached — re-measure. If there is no warning, the page is genuinely stable; check the metric values to see the real spread. |
+| Site breaks when a query string is added | Cache busting appends `?psi_nonce=…` to the measured URL. | Rare, but real for strict routers. Use `cacheBust: false` in library code, or confirm the site is measured correctly. |
 
 ## Automation
 

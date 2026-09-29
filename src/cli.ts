@@ -13,6 +13,7 @@ loadEnv();
 const FILTER_GROUPS = ['opportunity', 'diagnostic', 'passed', 'informative'] as const;
 const SORT_FIELDS = ['savingsMs', 'savingsBytes', 'score'] as const;
 const ORDERS = ['asc', 'desc'] as const;
+const PARTIES = ['any', 'first', 'third'] as const;
 
 interface CliOptions {
   /** Re-filter an already stored report instead of spending more quota. */
@@ -29,6 +30,7 @@ interface CliOptions {
   search?: string;
   id?: string[];
   hasItems?: boolean;
+  party: (typeof PARTIES)[number];
   sortBy: SortField;
   order: SortOrder;
   limit?: number;
@@ -57,6 +59,8 @@ Options:
   --search <text>         Case-insensitive match on audit id or title
   --id <list>             Comma separated audit ids
   --hasItems              Only insights that carry a details item list
+  --party <any|first|third>  Whose cost counts (default any)
+                          first = drop insights charged to other people's domains
   --sortBy <field>        savingsMs | savingsBytes | score (default savingsMs)
   --order <asc|desc>      default desc (most savings first)
   --limit <n>             Max insights to print
@@ -120,6 +124,7 @@ export function parseArgs(argv: string[]): CliOptions | null {
   let minSavingsBytes: number | undefined;
   let maxScore: number | undefined;
   let hasItems: boolean | undefined;
+  let party: (typeof PARTIES)[number] = 'any';
   let sortBy: SortField = 'savingsMs';
   let order: SortOrder = 'desc';
   let limit: number | undefined;
@@ -198,6 +203,15 @@ export function parseArgs(argv: string[]): CliOptions | null {
         maxScore = toNumber(takeValue(argv, i, arg), arg);
         i += 1;
         break;
+      case '--party': {
+        const value = takeValue(argv, i, arg);
+        if (!PARTIES.includes(value as (typeof PARTIES)[number])) {
+          fail(`--party must be one of: ${PARTIES.join(', ')}`);
+        }
+        party = value as (typeof PARTIES)[number];
+        i += 1;
+        break;
+      }
       case '--hasItems':
         hasItems = true;
         break;
@@ -260,6 +274,7 @@ export function parseArgs(argv: string[]): CliOptions | null {
     minSavingsBytes,
     maxScore,
     hasItems,
+    party,
     sortBy,
     order,
     limit,
@@ -305,6 +320,7 @@ function renderHuman(options: CliOptions, report: Awaited<ReturnType<typeof runR
     search: options.search,
     id: options.id,
     hasItems: options.hasItems,
+    party: options.party,
     sortBy: options.sortBy,
     order: options.order,
     limit: options.limit,
@@ -372,7 +388,7 @@ function renderHuman(options: CliOptions, report: Awaited<ReturnType<typeof runR
     );
     for (const insight of insights) {
       const saving =
-        insight.savingsMs !== undefined && insight.savingsMs > 0 ? formatMs(insight.savingsMs) : '-';
+        insight.savingsMs !== null && insight.savingsMs > 0 ? formatMs(insight.savingsMs) : '-';
       const affected = (insight.metricsAffected ?? []).slice(0, 2).join(',') || '-';
       const items = insight.itemsTotal ?? insight.items?.length ?? 0;
       lines.push(
@@ -461,6 +477,7 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
         search: options.search,
         id: options.id,
         hasItems: options.hasItems,
+        party: options.party,
         sortBy: options.sortBy,
         order: options.order,
         limit: options.limit,

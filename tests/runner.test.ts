@@ -160,3 +160,98 @@ describe('runReport', () => {
     expect(result.report.reportId).toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}Z-mobile$/);
   });
 });
+
+describe('cached-run detection', () => {
+  /**
+   * Emulates PSI's per-URL cache. `lighthouseResult.fetchTime` is what the
+   * runner compares, so that is the field the stub has to vary.
+   */
+  function cachedFetch(stamp: string) {
+    return (async () => {
+      const raw = JSON.parse(JSON.stringify(fixtureRaw)) as {
+        lighthouseResult: { fetchTime: string };
+      };
+      raw.lighthouseResult.fetchTime = stamp;
+      return fakeResponse(raw);
+    }) as unknown as typeof fetch;
+  }
+
+  it('warns when every run came back with the same analysis timestamp', async () => {
+    const result = await runReport({
+      url: 'https://example.com/',
+      runs: 4,
+      save: false,
+      fetchImpl: cachedFetch('2026-01-01T00:00:00.000Z'),
+      sleepImpl: noSleep,
+      targets,
+    });
+
+    expect(result.warnings.join(' ')).toMatch(/same analysis timestamp/i);
+    expect(result.warnings.join(' ')).toMatch(/not\s+independent samples/i);
+  });
+
+  it('warns when only some runs were cached', async () => {
+    let call = 0;
+    const impl = (async () => {
+      call += 1;
+      const stamp = call <= 2 ? '2026-01-01T00:00:00.000Z' : `2026-01-01T00:00:0${call}.000Z`;
+      const raw = JSON.parse(JSON.stringify(fixtureRaw)) as { lighthouseResult: { fetchTime: string } };
+      raw.lighthouseResult.fetchTime = stamp;
+      return fakeResponse(raw);
+    }) as unknown as typeof fetch;
+
+    const result = await runReport({
+      url: 'https://example.com/',
+      runs: 4,
+      save: false,
+      fetchImpl: impl,
+      sleepImpl: noSleep,
+      targets,
+    });
+
+    expect(result.warnings.join(' ')).toMatch(/distinct measurements/i);
+  });
+
+  it('stays silent when every run is genuinely distinct', async () => {
+    let call = 0;
+    const impl = (async () => {
+      call += 1;
+      const raw = JSON.parse(JSON.stringify(fixtureRaw)) as { lighthouseResult: { fetchTime: string } };
+      raw.lighthouseResult.fetchTime = `2026-01-01T00:00:0${call}.000Z`;
+      return fakeResponse(raw);
+    }) as unknown as typeof fetch;
+
+    const result = await runReport({
+      url: 'https://example.com/',
+      runs: 3,
+      save: false,
+      fetchImpl: impl,
+      sleepImpl: noSleep,
+      targets,
+    });
+
+    expect(result.warnings).toEqual([]);
+  });
+
+  it('gives each run its own cache-busting param', async () => {
+    const requested: string[] = [];
+    const impl = (async (input: string) => {
+      requested.push(new URL(String(input)).searchParams.get('url') ?? '');
+      const raw = JSON.parse(JSON.stringify(fixtureRaw)) as { lighthouseResult: { fetchTime: string } };
+      raw.lighthouseResult.fetchTime = `2026-01-01T00:00:0${requested.length}.000Z`;
+      return fakeResponse(raw);
+    }) as unknown as typeof fetch;
+
+    await runReport({
+      url: 'https://example.com/',
+      runs: 3,
+      save: false,
+      fetchImpl: impl,
+      sleepImpl: noSleep,
+      targets,
+    });
+
+    expect(new Set(requested).size).toBe(3);
+    expect(requested.every((u) => u.startsWith('https://example.com/?psi_nonce='))).toBe(true);
+  });
+});

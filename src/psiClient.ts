@@ -109,6 +109,12 @@ export interface PsiCallOptions {
   randomImpl?: () => number;
   /** Base delay for the exponential backoff. */
   backoffBaseMs?: number;
+  cacheBust?: boolean;
+  /**
+   * Builds the per-run cache-busting suffix. Injected so tests are deterministic.
+   * Must be unique per run, because PSI caches per-URL, not per-parameter.
+   */
+  cacheBustIdImpl?: () => string;
   onRetry?: (info: RetryInfo) => void;
   /** Aborts the whole call including retries. */
   signal?: AbortSignal;
@@ -122,6 +128,25 @@ export interface PsiCallResult {
   attempts: number;
   durationMs: number;
   fetchedAt: string;
+  /** The URL actually requested - includes the cache-busting param when enabled. */
+  requestedUrl: string;
+  /** Upstream `analysisUTCTimestamp`. Equal across runs means PSI served a cached report. */
+  analysisUTCTimestamp: string | null;
+}
+
+/**
+ * PSI caches per-URL: asking for the same URL twice in a row returns one
+ * Lighthouse run, not two. Without a unique param per request, N "runs" are the
+ * same measurement counted N times and the median is meaningless.
+ */
+export const CACHE_BUST_PARAM = 'psi_nonce';
+
+const defaultCacheBustId = (): string =>
+  `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`;
+
+/** Append a unique param so each run forces a real Lighthouse execution. */
+export function withCacheBust(url: string, id: string): string {
+  return `${url}${url.includes('?') ? '&' : '?'}${CACHE_BUST_PARAM}=${id}`;
 }
 
 const defaultSleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
@@ -183,13 +208,17 @@ export async function runPsiCall(options: PsiCallOptions): Promise<PsiCallResult
     sleepImpl = defaultSleep,
     randomImpl = Math.random,
     backoffBaseMs = 1000,
+    cacheBust = true,
+    cacheBustIdImpl = defaultCacheBustId,
     onRetry,
     signal,
   } = options;
 
   const startedAt = Date.now();
+  // Keep the report/target free of the nonce; only the wire request carries it.
+  const requestedUrl = cacheBust ? withCacheBust(url, cacheBustIdImpl()) : url;
   const params = new URLSearchParams({
-    url,
+    url: requestedUrl,
     strategy,
     category: categories.join(','),
   });
@@ -265,6 +294,11 @@ export async function runPsiCall(options: PsiCallOptions): Promise<PsiCallResult
       signal?.removeEventListener('abort', onOuterAbort);
     }
 
+    const analysisUTCTimestamp =
+      typeof (body as { analysisUTCTimestamp?: unknown })?.analysisUTCTimestamp === 'string'
+        ? ((body as { analysisUTCTimestamp: string }).analysisUTCTimestamp)
+        : null;
+
     return {
       raw: body,
       url,
@@ -273,6 +307,8 @@ export async function runPsiCall(options: PsiCallOptions): Promise<PsiCallResult
       attempts: attempt,
       durationMs: Date.now() - startedAt,
       fetchedAt: new Date().toISOString(),
+      requestedUrl,
+      analysisUTCTimestamp,
     };
   }
 

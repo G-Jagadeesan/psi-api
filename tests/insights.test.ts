@@ -66,11 +66,13 @@ describe('normalizeReport', () => {
     expect(audit?.itemsTotal).toBe(30);
   });
 
-  it('omits itemsTotal when nothing was trimmed', () => {
+  it('always reports itemsTotal, even when nothing was trimmed', () => {
     const report = normalizeFixture();
     const audit = report.insights.find((i) => i.id === 'font-display-insight');
     expect(audit?.items).toHaveLength(2);
-    expect(audit?.itemsTotal).toBeUndefined();
+    // Was only set past the 25-row cut, which made the row count unanswerable
+    // for every smaller insight.
+    expect(audit?.itemsTotal).toBe(2);
   });
 
   it('still reads metrics for audits Lighthouse marks hidden', () => {
@@ -136,11 +138,12 @@ describe('grouping', () => {
     expect(insight?.savingsBytes).toBe(2_565_000);
   });
 
-  it('reports no savings at all when nothing reports one', () => {
+  it('reports savings as null rather than zero when Lighthouse gives no estimate', () => {
     const report = normalizeFixture();
     const insight = report.insights.find((i) => i.id === 'third-party-summary');
-    expect(insight?.savingsMs).toBeUndefined();
-    expect(insight?.savingsBytes).toBeUndefined();
+    // Zero would read as "this saves nothing", which is a different claim.
+    expect(insight?.savingsMs).toBeNull();
+    expect(insight?.savingsBytes).toBeNull();
   });
 
   it('surfaces an -insight audit that is missing from the category auditRefs', () => {
@@ -191,5 +194,203 @@ describe('grouping', () => {
     // Insight audits are always actionable diagnostics.
     expect(groupForAudit('y-insight', null, 'informative', 'list')).toBe('diagnostic');
     expect(groupForAudit('y-insight', 1, 'informative', 'list')).toBe('passed');
+  });
+});
+
+describe('first vs third party attribution', () => {
+  const withAudits = (audits: Record<string, unknown>) =>
+    normalizeFixture((raw) => {
+      Object.assign((raw as { lighthouseResult: { audits: Record<string, unknown> } }).lighthouseResult.audits, audits);
+    });
+
+  it('counts items served from the measured domain as first party', () => {
+    const report = withAudits({
+      'image-delivery-insight': {
+        id: 'image-delivery-insight',
+        title: 'Improve image delivery',
+        score: 0,
+        scoreDisplayMode: 'binary',
+        details: {
+          type: 'opportunity',
+          items: [
+            { url: 'https://example.com/a.jpg', wastedBytes: 1000 },
+            { url: 'https://example.com/b.jpg', wastedBytes: 2000 },
+          ],
+        },
+      },
+    });
+    const insight = report.insights.find((i) => i.id === 'image-delivery-insight');
+    expect(insight?.firstPartyItems).toBe(2);
+    expect(insight?.thirdPartyItems).toBe(0);
+    expect(insight?.itemHosts).toEqual(['example.com']);
+  });
+
+  it('treats a sibling subdomain as first party, since you own the fix', () => {
+    const report = withAudits({
+      'cache-insight': {
+        id: 'cache-insight',
+        title: 'Use efficient cache lifetimes',
+        score: 0,
+        scoreDisplayMode: 'binary',
+        details: { items: [{ url: 'https://media.example.com/hero.jpg', wastedBytes: 10 }] },
+      },
+    });
+    const insight = report.insights.find((i) => i.id === 'cache-insight');
+    expect(insight?.firstPartyItems).toBe(1);
+    expect(insight?.thirdPartyItems).toBe(0);
+  });
+
+  it('counts a foreign domain as third party even with a large saving', () => {
+    const report = withAudits({
+      'legacy-javascript-insight': {
+        id: 'legacy-javascript-insight',
+        title: 'Reduce legacy JavaScript',
+        score: 0,
+        scoreDisplayMode: 'binary',
+        metricSavings: { TBT: 5000 },
+        details: { items: [{ url: 'https://static.cloudflareinsights.com/beacon.min.js', wastedMs: 5000 }] },
+      },
+    });
+    const insight = report.insights.find((i) => i.id === 'legacy-javascript-insight');
+    expect(insight?.savingsMs).toBe(5000);
+    expect(insight?.firstPartyItems).toBe(0);
+    expect(insight?.thirdPartyItems).toBe(1);
+    expect(insight?.itemHosts).toEqual(['static.cloudflareinsights.com']);
+  });
+
+  it('reads hosts out of nested subItems', () => {
+    const report = withAudits({
+      'third-parties-insight': {
+        id: 'third-parties-insight',
+        title: 'Reduce the impact of third parties',
+        score: 1,
+        scoreDisplayMode: 'informative',
+        details: {
+          items: [
+            {
+              entity: 'Stripe',
+              subItems: { items: [{ url: 'https://js.stripe.com/v3/' }, { url: 'https://m.stripe.network/x' }] },
+            },
+          ],
+        },
+      },
+    });
+    const insight = report.insights.find((i) => i.id === 'third-parties-insight');
+    expect(insight?.firstPartyItems).toBe(0);
+    expect(insight?.thirdPartyItems).toBe(1);
+    expect(insight?.itemHosts).toEqual(['js.stripe.com', 'm.stripe.network']);
+  });
+
+  it('treats an item mixing your CDN with a vendor as first party', () => {
+    const report = withAudits({
+      'bootup-time': {
+        id: 'bootup-time',
+        title: 'Reduce JavaScript execution time',
+        score: 0,
+        scoreDisplayMode: 'binary',
+        details: {
+          items: [
+            {
+              url: 'https://example.com/app.js',
+              subItems: { items: [{ url: 'https://cdn.vendor.com/lib.js' }] },
+            },
+          ],
+        },
+      },
+    });
+    const insight = report.insights.find((i) => i.id === 'bootup-time');
+    expect(insight?.firstPartyItems).toBe(1);
+    expect(insight?.thirdPartyItems).toBe(0);
+  });
+
+  it('leaves insights with no URLs unattributed rather than calling them third party', () => {
+    const report = withAudits({
+      'mainthread-work-breakdown': {
+        id: 'mainthread-work-breakdown',
+        title: 'Minimize main thread work',
+        score: 0.5,
+        scoreDisplayMode: 'binary',
+        details: {
+          items: [
+            { group: 'scriptEvaluation', duration: 9393 },
+            { group: 'other', duration: 4135 },
+          ],
+        },
+      },
+    });
+    const insight = report.insights.find((i) => i.id === 'mainthread-work-breakdown');
+    // Unattributed, so it must not be filtered out by party=first - the cost is
+    // most likely the site's own JavaScript.
+    expect(insight?.firstPartyItems).toBe(0);
+    expect(insight?.thirdPartyItems).toBe(0);
+  });
+
+  it('promotes third-parties-insight out of passed so it cannot hide at the bottom', () => {
+    const report = withAudits({
+      'third-parties-insight': {
+        id: 'third-parties-insight',
+        title: 'Reduce the impact of third parties',
+        score: 1,
+        scoreDisplayMode: 'informative',
+        details: { items: [{ entity: 'Stripe', subItems: { items: [{ url: 'https://js.stripe.com/v3/' }] } }] },
+      },
+    });
+    const insight = report.insights.find((i) => i.id === 'third-parties-insight');
+    expect(insight?.group).toBe('diagnostic');
+  });
+});
+
+describe('cache-busting param never reaches the report', () => {
+  it('strips the nonce from the final url', () => {
+    const report = normalizeFixture((raw) => {
+      (raw as { lighthouseResult: { finalUrl: string } }).lighthouseResult.finalUrl =
+        'https://example.com/?psi_nonce=abc123';
+    });
+    expect(report.finalUrl).toBe('https://example.com/');
+  });
+
+  it('strips the nonce from item urls, including nested ones', () => {
+    const report = normalizeFixture((raw) => {
+      const audits = (raw as { lighthouseResult: { audits: Record<string, unknown> } }).lighthouseResult.audits;
+      audits['image-delivery-insight'] = {
+        id: 'image-delivery-insight',
+        title: 'Improve image delivery',
+        score: 0,
+        scoreDisplayMode: 'binary',
+        details: {
+          items: [
+            { url: 'https://example.com/a.jpg?psi_nonce=zzz' },
+            {
+              entity: 'Stripe',
+              subItems: {
+                items: [
+                  { url: 'https://m.stripe.network/i.html#url=https%3A%2F%2Fexample.com%2F%3Fpsi_nonce%3Dzzz' },
+                ],
+              },
+            },
+          ],
+        },
+      };
+    });
+    const insight = report.insights.find((i) => i.id === 'image-delivery-insight');
+    const serialized = JSON.stringify(insight?.items);
+    expect(serialized).not.toContain('psi_nonce');
+  });
+});
+
+describe('field data is stripped too', () => {
+  it('removes the nonce from CrUX initial_url', () => {
+    const report = normalizeFixture((raw) => {
+      (raw as { loadingExperience: unknown }).loadingExperience = {
+        metrics: { LARGEST_CONTENTFUL_PAINT_MS: { percentile: 75 } },
+        initial_url: 'https://example.com/zen-class/?psi_nonce=abc123',
+      };
+    });
+    const serialized = JSON.stringify(report.fieldData);
+    expect(serialized).not.toContain('psi_nonce');
+    const loading = report.fieldData as {
+      loadingExperience: { initial_url: string };
+    };
+    expect(loading.loadingExperience.initial_url).toBe('https://example.com/zen-class/');
   });
 });

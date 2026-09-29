@@ -241,10 +241,12 @@ describe('insight aggregation', () => {
     expect(byMedian?.stats.savingsMs.mode).toBe(300); // three distinct buckets tie
   });
 
-  it('leaves savingsMs undefined when no run reported savings', () => {
+  it('reports savingsMs as null, not undefined, when no run estimated one', () => {
     const report = aggregateReports(reportsFor([50, 60]));
     const insight = report.insights.find((i) => i.id === 'network-requests');
-    expect(insight?.savingsMs).toBeUndefined();
+    // null and undefined are different facts: "no estimate" vs "key absent".
+    expect(insight?.savingsMs).toBeNull();
+    expect(insight?.stats.savingsMs).toBeNull();
     expect(insight?.items).toBeDefined();
   });
 

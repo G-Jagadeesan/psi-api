@@ -58,10 +58,18 @@ BELOW TARGET  score -63 lcp +13570 tbt +1927
 ```bash
 npm run psi -- --reportId <reportId> \
   --group opportunity,diagnostic --maxScore 0.9 \
-  --sortBy savingsMs --limit 10
+  --party first --sortBy savingsMs --limit 10
 ```
 
 Using `--reportId` re-filters the report you already paid for. **Never re-run PSI just to change a filter** — each run is a quota unit and several minutes of wall clock.
+
+**`--party first` is not optional.** Without it the queue fills up with other people's code. On this project's own deployed page the two highest-saving actionable findings were both `static.cloudflareinsights.com` — Cloudflare's analytics beacon — which no edit to the repo can fix. `--party first` drops anything charged to a foreign host while keeping unattributed findings like main-thread breakdowns, which are usually your own JavaScript. Check third-party cost separately with `--party third`, and log it; do not attempt it.
+
+**Some findings have no savings estimate at all.** `savingsMs: null` means Lighthouse did not estimate one, which is different from `0` (estimated as worthless). Checklist-style insights such as `lcp-discovery-insight` report a real failure with no time figure, and they sort last as unknown. To surface them deliberately:
+
+```bash
+npm run psi -- --reportId <reportId> --group diagnostic --maxScore 0.9 --sortBy score --order asc
+```
 
 Add `--metric lcp` / `tbt` / `cls` to focus on the metric that is actually failing, and `--noFlaky` to drop intermittent findings.
 
@@ -71,8 +79,9 @@ Add `--metric lcp` / `tbt` / `cls` to focus on the metric that is actually faili
 2. Within it, the largest `savingsMs` first.
 3. `flaky: true` insights (seen in under 30% of runs) go to the bottom — they are usually a third party you do not control.
 4. A `diagnostic` with a large saving beats an `opportunity` with a small one.
+5. `savingsMs: null` means "no estimate", not "no gain". A failing insight with a null estimate can still be the right thing to fix — do not skip it just because it sorts low.
 
-Before you commit to a fix, sanity-check the number. Lighthouse savings are estimates and routinely disagree with reality — a "1.2 s LCP saving" on a page whose LCP is 16 s is a rounding error, not a win. **Rank by what moves the failing metric, not by the raw saving.**
+**Verify the number, and verify the ownership, before you commit to a fix.** Lighthouse savings are estimates and routinely disagree with reality — a "1.2 s LCP saving" on a page whose LCP is 16 s is a rounding error, not a win. **Rank by what moves the failing metric, not by the raw saving.** And confirm the insight is first-party: check `itemHosts`, `firstPartyItems` and `thirdPartyItems` on the insight before you read any source code.
 
 ### Step 4 — Read the SOP, then map the insight to an allowed action
 
@@ -92,11 +101,23 @@ Then, for the insight you picked, find the action it maps to:
 | `third-parties-insight` | Third-party cost | Usually **not yours** — document it, do not attempt it |
 | `cls-culprits-insight`, `cumulative-layout-shift` | Layout shift | §5 spacing, §7 never Store static arrays, images need dimensions |
 | `forced-reflow-insight` | Synchronous layout thrash | §7 no `useVisibleTask$` on first fold, §7 `noSerialize` for lib instances |
-| `cache-insight`, `document-latency-insight` | Headers / server latency | **Likely outside the frontend.** If the SOP does not cover it, stop and ask. |
+| `cache-insight`, `document-latency-insight` | Headers / server latency | **Likely outside the frontend.** If the SOP does not cover it, stop and ask. Note `document-latency-insight` often carries a large estimate with zero items — it is unattributed, so `--party first` will not filter it out. Judge it by whether the number is plausible against the real LCP, not by the estimate. |
 | `non-composited-animations` | Animating layout properties | §8 GPU-only (`transform`/`opacity`) — explicitly required |
 | `dom-size-insight` | Oversized DOM | §4 components must be self-contained; §7 no duplicated markup |
 
 **If the SOP does not cover the fix, or covers it differently than the insight suggests: stop and ask a human. Do not improvise a change to the app.** The SOP's precedence is explicit user ask > `DESIGN.md` > SOP > neighbor style, and it forbids disabling lint rules and unapproved packages. A performance win is not a licence to bypass that.
+
+**The grep gate — do not skip this.** Lighthouse has no idea what your repository looks like. It reports DOM selectors, HTML snippets and resource URLs, never file paths. Before you propose any change you must prove the thing exists in the code:
+
+```bash
+# take a class name, id, or URL fragment from the insight's items and search for it
+grep -rn "image__dam-img" src/
+```
+
+- **Grep finds it** → you have a file. Read it, confirm the insight describes the problem you found, then change it.
+- **Grep finds nothing** → the cost is not in code you own. Log it under "not actionable in repo" with the `itemHosts` that told you so, and move to the next insight. **Do not create a file to satisfy the audit, and do not edit a third party's script.**
+
+An insight that greps cleanly is a finding, not a task. On a real report of this project, `cache-insight` and `legacy-javascript-insight` both pointed at Cloudflare's beacon — high savings, zero greppable source.
 
 ### Step 5 — One change
 
@@ -201,6 +222,8 @@ Loop from Step 2. Stop when `meetsTarget` is `true`, or when you hit the iterati
 
 **Why 10 runs.** A single Lighthouse run is a lab measurement on a shared, throttled connection. Run-to-run score varies by several points on an unchanged page. Ten runs gives the median something stable to sit on and gives `stddev` enough samples to be meaningful. Three runs is a reasonable quick look while you are still exploring; it is not enough to accept a change on.
 
+> **PSI caches per URL.** Ask for the same URL twice in a row and you get *one* Lighthouse run back, not two — the tool works around this by adding a unique `?psi_nonce=…` to every request, and by warning you if the runs collapse to a single timestamp. **If you see that warning, the report is not a real measurement. Discard it and re-run.** Never accept a change on the strength of a cached report.
+
 **Why median is the headline.** Lighthouse is right-skewed — an occasional run catches a slow third-party response and drags the page down. The mean follows those outliers; the median does not. Compare **median to median**.
 
 **When to use mean.** Only when you specifically care about average user cost, and always alongside `stddev`. Useful for judging how bad the bad runs are, not for deciding whether a change worked.
@@ -210,6 +233,11 @@ Loop from Step 2. Stop when `meetsTarget` is `true`, or when you hit the iterati
 **What `flaky: true` means.** The insight appeared in fewer than 30% of successful runs. It is intermittent. Deprioritize it: a flaky finding may not reproduce when you re-measure, so you cannot tell your fix from the noise. If a flaky insight is enormous, check whether a third party is involved before touching anything.
 
 **Accepting a change.** Require the improvement to exceed roughly one `stddev` of the baseline. If it does not, the honest answer is "inconclusive", not "small win". Re-measure once to break the tie; if still inconclusive, revert and note it in the log. Small real wins are still real — but you cannot distinguish them from noise, and shipping a change you cannot measure is how regressions accumulate.
+
+**When `stddev` is `0.0`.** The threshold above silently stops working, so work out which of the two causes you are looking at before deciding anything:
+
+- **The tool warned "same analysis timestamp"** → the runs were served from PSI's cache. The report is worthless. Re-measure. Do not compare anything against it.
+- **No warning** → the page is genuinely pinned, usually because it sits far inside the "good" band or already scores 100. A real `cnn.com` baseline showed `25, 29, 27, 35, 36` (stddev 4.9) while `example.com` shows `100, 100, 100` because every run rounds to the ceiling. In that case judge the change on the **metric values and the target comparison** — does LCP actually drop by more than its own spread? — rather than on the score, and require a real margin instead of "> 1 stddev", which is meaningless at zero.
 
 ---
 
@@ -389,6 +417,9 @@ curl http://127.0.0.1:3939/health
 **Checklist before you say you are done:**
 
 - [ ] `sop-qwik.md` read in full this session
+- [ ] Baseline and re-measurement both free of the "same analysis timestamp" cache warning
+- [ ] Work queue built with `--party first`, and every chosen insight grepped to a real file
+- [ ] Third-party findings logged as "not actionable in repo", not attempted
 - [ ] Every change maps to an action the SOP allows
 - [ ] One focused change, on a branch off `development`
 - [ ] Commit message names the insight id, no AI attribution

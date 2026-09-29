@@ -145,8 +145,8 @@ function accumulateInsights(reports: NormalizedReport[]): Map<string, InsightAcc
         byId.set(insight.id, {
           representative: insight,
           scoreValues: insight.score === null ? [] : [insight.score],
-          savingsMsValues: insight.savingsMs === undefined ? [] : [insight.savingsMs],
-          savingsBytesValues: insight.savingsBytes === undefined ? [] : [insight.savingsBytes],
+          savingsMsValues: insight.savingsMs === null ? [] : [insight.savingsMs],
+          savingsBytesValues: insight.savingsBytes === null ? [] : [insight.savingsBytes],
           appearances: 1,
         });
         continue;
@@ -154,8 +154,8 @@ function accumulateInsights(reports: NormalizedReport[]): Map<string, InsightAcc
 
       existing.appearances += 1;
       if (insight.score !== null) existing.scoreValues.push(insight.score);
-      if (insight.savingsMs !== undefined) existing.savingsMsValues.push(insight.savingsMs);
-      if (insight.savingsBytes !== undefined) existing.savingsBytesValues.push(insight.savingsBytes);
+      if (insight.savingsMs !== null) existing.savingsMsValues.push(insight.savingsMs);
+      if (insight.savingsBytes !== null) existing.savingsBytesValues.push(insight.savingsBytes);
 
       // Prefer metadata from an occurrence that actually carries it.
       if (existing.representative.items === undefined && insight.items !== undefined) {
@@ -177,10 +177,10 @@ function accumulateInsights(reports: NormalizedReport[]): Map<string, InsightAcc
           displayValue: insight.displayValue,
         };
       }
-      if (existing.representative.savingsMs === undefined && insight.savingsMs !== undefined) {
+      if (existing.representative.savingsMs === null && insight.savingsMs !== null) {
         existing.representative = { ...existing.representative, savingsMs: insight.savingsMs };
       }
-      if (existing.representative.savingsBytes === undefined && insight.savingsBytes !== undefined) {
+      if (existing.representative.savingsBytes === null && insight.savingsBytes !== null) {
         existing.representative = { ...existing.representative, savingsBytes: insight.savingsBytes };
       }
     }
@@ -231,10 +231,10 @@ function aggregateInsights(
     if (base.displayValue === undefined && fallback.displayValue !== undefined) {
       base.displayValue = fallback.displayValue;
     }
-    if (base.savingsMs === undefined && fallback.savingsMs !== undefined) {
+    if (base.savingsMs === null && fallback.savingsMs !== null) {
       base.savingsMs = fallback.savingsMs;
     }
-    if (base.savingsBytes === undefined && fallback.savingsBytes !== undefined) {
+    if (base.savingsBytes === null && fallback.savingsBytes !== null) {
       base.savingsBytes = fallback.savingsBytes;
     }
 
@@ -246,15 +246,15 @@ function aggregateInsights(
       ...base,
       id,
       score: acc.scoreValues.length > 0 ? scoreStats[stat] : null,
-      savingsMs: acc.savingsMsValues.length > 0 ? savingsMsStats[stat] : undefined,
-      savingsBytes: acc.savingsBytesValues.length > 0 ? savingsBytesStats[stat] : undefined,
+      savingsMs: acc.savingsMsValues.length > 0 ? savingsMsStats[stat] : null,
+      savingsBytes: acc.savingsBytesValues.length > 0 ? savingsBytesStats[stat] : null,
       appearedInRuns: acc.appearances,
       runsSucceeded,
       flaky: acc.appearances / runsSucceeded < FLAKY_THRESHOLD,
       stats: {
         score: scoreStats,
-        savingsMs: savingsMsStats,
-        savingsBytes: savingsBytesStats,
+        savingsMs: acc.savingsMsValues.length > 0 ? savingsMsStats : null,
+        savingsBytes: acc.savingsBytesValues.length > 0 ? savingsBytesStats : null,
       },
     });
   }

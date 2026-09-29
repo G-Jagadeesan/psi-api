@@ -9,6 +9,7 @@ import type {
   SortOrder,
   Strategy,
 } from './types.js';
+import { CACHE_BUST_PARAM } from './psiClient.js';
 import { METRIC_KEYS } from './types.js';
 
 export const MAX_ITEMS = 25;
@@ -206,28 +207,199 @@ function sumItemField(details: unknown, keys: string[]): number | undefined {
 function savingsFromDetails(
   audit: RawAudit,
   details: unknown,
-): { savingsMs?: number; savingsBytes?: number } {
-  const out: { savingsMs?: number; savingsBytes?: number } = {};
-
+): { savingsMs: number | null; savingsBytes: number | null } {
   const ms = savingsMsFrom(audit, details);
-  if (ms !== undefined) out.savingsMs = ms;
 
+  let bytes: number | undefined;
   if (details && typeof details === 'object') {
     const record = details as Record<string, unknown>;
-    const bytes = asNumber(record.overallSavingsBytes) ?? sumItemField(details, ['wastedBytes']);
-    if (bytes !== undefined) out.savingsBytes = bytes;
+    bytes = asNumber(record.overallSavingsBytes) ?? sumItemField(details, ['wastedBytes']);
   }
 
-  return out;
+  return {
+    // Null, not 0: "no estimate" and "no gain" are different facts and only one
+    // of them is a reason to skip an insight.
+    savingsMs: ms === undefined ? null : Math.round(ms),
+    savingsBytes: bytes === undefined ? null : Math.round(bytes),
+  };
 }
 
-function itemsFromDetails(details: unknown): { items?: unknown[]; itemsTotal?: number } {
-  if (!details || typeof details !== 'object') return {};
-  const items = (details as { items?: unknown }).items;
-  if (!Array.isArray(items)) return {};
+/**
+ * The cache-busting param this tool adds so PSI cannot reuse one report for
+ * every run. Lighthouse echoes the measured URL back in several places,
+ * including third-party iframe URLs, so it is stripped before anything is
+ * reported - a report should not claim the site was loaded with a query param
+ * the site never saw in production.
+ */
+export function stripCacheBust(value: string): string {
+  if (!value.includes(CACHE_BUST_PARAM)) return value;
+
+  // Absolute URL: let URL do the cleanup so no dangling "?" or "&" is left.
+  try {
+    const parsed = new URL(value);
+    parsed.searchParams.delete(CACHE_BUST_PARAM);
+    // Third-party iframes often mirror the page URL into their fragment, where
+    // it is percent-encoded and invisible to searchParams.
+    if (parsed.hash.includes(CACHE_BUST_PARAM)) {
+      parsed.hash = parsed.hash
+        .replace(new RegExp(`%3F${CACHE_BUST_PARAM}%3D[^&]*`, 'gi'), '')
+        .replace(new RegExp(`[?&]${CACHE_BUST_PARAM}=[^&]*`, 'gi'), '');
+    }
+    return parsed.toString();
+  } catch {
+    // Relative or malformed URL: fall back to a textual strip.
+    return value
+      .replace(new RegExp(`([?&])${CACHE_BUST_PARAM}=[^&#]*`, 'g'), '')
+      .replace(/[?&]$/, '');
+  }
+}
+
+function hostOf(value: unknown): string | null {
+  if (typeof value !== 'string' || !/^https?:\/\//i.test(value)) return null;
+  try {
+    return new URL(stripCacheBust(value)).host.toLowerCase();
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * The measured site's own domain, with a leading `www.` removed, so that
+ * `media.example.com` counts as first-party when `www.example.com` was measured.
+ * Deliberately not a public-suffix implementation: that would need a
+ * maintained list to avoid treating `example.co.uk` as the registrable domain.
+ */
+export function baseHostOf(url: string): string {
+  const host = hostOf(url);
+  if (!host) return '';
+  return host.replace(/^www\./, '');
+}
+
+function isFirstPartyHost(host: string, baseHost: string): boolean {
+  if (!baseHost) return false;
+  return host === baseHost || host.endsWith(`.${baseHost}`);
+}
+
+/** Collect every resource URL an item refers to, including nested sub-items. */
+function itemUrls(item: unknown, depth = 0): string[] {
+  if (!item || typeof item !== 'object' || depth > 3) return [];
+  const record = item as Record<string, unknown>;
+  const urls: string[] = [];
+  if (typeof record.url === 'string') urls.push(record.url);
+  const sub = record.subItems as { items?: unknown } | undefined;
+  if (Array.isArray(sub?.items)) {
+    for (const child of sub.items) urls.push(...itemUrls(child, depth + 1));
+  }
+  return urls;
+}
+
+function itemsFromDetails(details: unknown): { items?: unknown[]; itemsTotal: number } {
+  const items = detailItemsOf(details);
+  if (items.length === 0 && !Array.isArray((details as { items?: unknown } | null)?.items)) {
+    return { itemsTotal: 0 };
+  }
   return {
     items: items.slice(0, MAX_ITEMS),
+    // Always set, not just when trimmed. A stored run that reported itemsTotal
+    // only past the 25-item cut made "how many rows are there" unanswerable for
+    // every smaller insight.
     itemsTotal: items.length,
+  };
+}
+
+/** Every `details.items` row, with the cache-busting param removed from any URL. */
+function detailItemsOf(details: unknown): unknown[] {
+  if (!details || typeof details !== 'object') return [];
+  const items = (details as { items?: unknown }).items;
+  if (!Array.isArray(items)) return [];
+  return items.map((item) => stripCacheBustDeep(item));
+}
+
+/**
+ * `third-parties-insight` exists precisely to list other people's code, so every
+ * row is third party by definition - even though its rows carry an `entity` name
+ * rather than a top-level URL.
+ */
+function thirdPartyByDefinition(items: unknown[]): PartyBreakdown {
+  const hosts = new Set<string>();
+  let attributed = 0;
+  for (const item of items) {
+    for (const url of itemUrls(item)) {
+      const host = hostOf(url);
+      if (host) {
+        hosts.add(host);
+        attributed += 1;
+      }
+    }
+  }
+  return {
+    firstPartyItems: 0,
+    thirdPartyItems: items.length,
+    itemHosts: [...hosts].slice(0, MAX_REPORTED_HOSTS).sort(),
+  };
+}
+
+/** Remove the cache-busting param from every URL anywhere inside an item. */
+function stripCacheBustDeep(value: unknown, depth = 0): unknown {
+  if (depth > 4) return value;
+  if (typeof value === 'string') return stripCacheBust(value);
+  if (Array.isArray(value)) return value.map((entry) => stripCacheBustDeep(entry, depth + 1));
+  if (value && typeof value === 'object') {
+    const out: Record<string, unknown> = {};
+    for (const [key, entry] of Object.entries(value as Record<string, unknown>)) {
+      out[key] = key === 'url' && typeof entry === 'string' ? stripCacheBust(entry) : stripCacheBustDeep(entry, depth + 1);
+    }
+    return out;
+  }
+  return value;
+}
+export interface PartyBreakdown {
+  firstPartyItems: number;
+  thirdPartyItems: number;
+  itemHosts: string[];
+}
+
+const MAX_REPORTED_HOSTS = 8;
+
+/**
+ * Split an insight's items into first-party and third-party by resource host.
+ *
+ * Without this, sorting by savings puts third-party CDN beacons and vendor tags
+ * at the top of the queue - on a real deployment the two largest actionable
+ * findings were both Cloudflare's own analytics script, which no amount of
+ * editing the app source can fix. Items with no URL at all (main-thread
+ * breakdowns, LCP phase breakdowns) count as neither, because their cost is
+ * unattributed and may well be first-party code.
+ */
+export function classifyItemParties(items: unknown[], baseHost: string): PartyBreakdown {
+  const hosts = new Set<string>();
+  let firstPartyItems = 0;
+  let thirdPartyItems = 0;
+
+  for (const item of items) {
+    const itemHosts = new Set<string>();
+    for (const url of itemUrls(item)) {
+      const host = hostOf(url);
+      if (host) itemHosts.add(host);
+    }
+    if (itemHosts.size === 0) continue;
+
+    let own = false;
+    for (const host of itemHosts) {
+      hosts.add(host);
+      if (isFirstPartyHost(host, baseHost)) own = true;
+    }
+    // An item is third-party if every host it loads is foreign. Mixed items
+    // (your CDN plus a vendor) still count as first-party, since you own part
+    // of the cost and part of the fix.
+    if (own) firstPartyItems += 1;
+    else thirdPartyItems += 1;
+  }
+
+  return {
+    firstPartyItems,
+    thirdPartyItems,
+    itemHosts: [...hosts].slice(0, MAX_REPORTED_HOSTS).sort(),
   };
 }
 
@@ -248,10 +420,12 @@ export function extractMetrics(audits: Record<string, RawAudit>): Metrics {
 export function extractFieldData(raw: RawPsiResponse): FieldData | null {
   const fieldData: FieldData = {};
   if (raw.loadingExperience !== undefined && raw.loadingExperience !== null) {
-    fieldData.loadingExperience = raw.loadingExperience;
+    // CrUX echoes `initial_url` back verbatim, nonce included, so it is stripped
+    // on the way through rather than passed through untouched.
+    fieldData.loadingExperience = stripCacheBustDeep(raw.loadingExperience);
   }
   if (raw.originLoadingExperience !== undefined && raw.originLoadingExperience !== null) {
-    fieldData.originLoadingExperience = raw.originLoadingExperience;
+    fieldData.originLoadingExperience = stripCacheBustDeep(raw.originLoadingExperience);
   }
   return Object.keys(fieldData).length > 0 ? fieldData : null;
 }
@@ -286,6 +460,12 @@ export function normalizeReport(
     if (typeof ref?.id === 'string') refById.set(ref.id, ref);
   }
 
+  // Lighthouse echoes the URL it was actually given, cache-busting param and
+  // all. Strip it so ownership is judged against the real site, and so nothing
+  // downstream reports a URL the site never served.
+  const finalUrl = stripCacheBust(asString(result.finalUrl, requestedUrl)) || requestedUrl;
+  const measuredUrl = finalUrl || requestedUrl;
+
   const insights: Insight[] = [];
 
   for (const [id, audit] of Object.entries(audits)) {
@@ -302,8 +482,14 @@ export function normalizeReport(
     const score = asScore(audit.score);
     const details = audit.details;
     const savings = savingsFromDetails(audit, details);
-    const { items, itemsTotal } = itemsFromDetails(details);
     const affected = metricsAffectedBy(audit, ref);
+
+    const rawItems = detailItemsOf(details);
+    // Classify across every row, not the trimmed 25, so firstPartyItems and
+    // thirdPartyItems are honest counts rather than a sample.
+    const party = audit.id === 'third-parties-insight'
+      ? thirdPartyByDefinition(rawItems)
+      : classifyItemParties(rawItems, baseHostOf(measuredUrl));
 
     const insight: Insight = {
       id,
@@ -312,6 +498,11 @@ export function normalizeReport(
       score,
       scoreDisplayMode,
       group: groupForAudit(id, score, scoreDisplayMode, detailsTypeOf(details)),
+      savingsMs: savings.savingsMs,
+      savingsBytes: savings.savingsBytes,
+      firstPartyItems: party.firstPartyItems,
+      thirdPartyItems: party.thirdPartyItems,
+      itemHosts: party.itemHosts,
     };
 
     const displayValue = asString(audit.displayValue);
@@ -323,18 +514,23 @@ export function normalizeReport(
     const numericUnit = asString(audit.numericUnit);
     if (numericUnit) insight.numericUnit = numericUnit;
 
-    if (savings.savingsMs !== undefined) insight.savingsMs = savings.savingsMs;
-    if (savings.savingsBytes !== undefined) insight.savingsBytes = savings.savingsBytes;
     if (affected.length > 0) insight.metricsAffected = affected;
-    if (items) insight.items = items;
-    if (itemsTotal !== undefined && itemsTotal > MAX_ITEMS) insight.itemsTotal = itemsTotal;
+    const { items, itemsTotal } = itemsFromDetails(details);
+    if (items && items.length > 0) insight.items = items;
+    if (itemsTotal > 0) insight.itemsTotal = itemsTotal;
+    // A third party that costs you time has not "passed". Filing it under
+    // `passed` buried it at the bottom of every savings-sorted work queue, which
+    // is exactly where an agent needs to see it in order to rule it out.
+    if (id === 'third-parties-insight' && itemsTotal > 0 && insight.group === 'passed') {
+      insight.group = 'diagnostic';
+    }
 
     insights.push(insight);
   }
 
   return {
     url: requestedUrl,
-    finalUrl: asString(result.finalUrl, requestedUrl),
+    finalUrl,
     strategy,
     fetchTime: asString(result.fetchTime, new Date().toISOString()),
     lighthouseVersion: asString(result.lighthouseVersion, 'unknown'),
@@ -371,6 +567,7 @@ export function filterInsights<T extends Insight>(insights: T[], filters: Insigh
     search,
     id,
     hasItems,
+    party = 'any',
     sortBy = 'savingsMs',
     order = 'desc',
     limit,
@@ -415,6 +612,14 @@ export function filterInsights<T extends Insight>(insights: T[], filters: Insigh
 
     if (ids && !ids.has(insight.id.toLowerCase())) return false;
     if (hasItems !== undefined && ((insight.items?.length ?? 0) > 0) !== hasItems) return false;
+
+    // `first` keeps anything not charged to a foreign host, including insights
+    // Lighthouse could not attribute to a URL at all - a main-thread breakdown
+    // with no script behind it is usually the site's own code. `third` is the
+    // inverse, and is how you inspect what the tag managers are costing you
+    // without it polluting the work queue.
+    if (party === 'first' && insight.thirdPartyItems > 0) return false;
+    if (party === 'third' && insight.thirdPartyItems === 0) return false;
 
     return true;
   });

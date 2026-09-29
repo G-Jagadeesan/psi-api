@@ -101,11 +101,13 @@ describe('runPsiCall', () => {
       apiKey: 'KEY123',
       fetchImpl,
       sleepImpl: noSleep,
+      // Pin the nonce so the assertion below stays deterministic.
+      cacheBustIdImpl: () => 'testnonce',
     });
 
     const parsed = new URL(requested);
     expect(parsed.origin + parsed.pathname).toBe('https://www.googleapis.com/pagespeedonline/v5/runPagespeed');
-    expect(parsed.searchParams.get('url')).toBe('https://example.com/');
+    expect(parsed.searchParams.get('url')).toBe('https://example.com/?psi_nonce=testnonce');
     expect(parsed.searchParams.get('strategy')).toBe('desktop');
     expect(parsed.searchParams.get('category')).toBe('performance,accessibility');
     expect(parsed.searchParams.get('key')).toBe('KEY123');
@@ -265,5 +267,65 @@ describe('runPsiCall', () => {
     }).catch(() => undefined);
 
     expect(calls).toBe(1);
+  });
+});
+
+describe('cache busting', () => {
+  it('appends a unique param per call so PSI cannot serve a cached report', async () => {
+    const seen: string[] = [];
+    const impl = (async (input: string) => {
+      seen.push(String(input));
+      return fakeResponse({ ...fixtureRaw, analysisUTCTimestamp: '2026-01-01T00:00:00.000Z' });
+    }) as unknown as typeof fetch;
+
+    await runPsiCall({ url: 'https://example.com/', fetchImpl: impl, cacheBustIdImpl: () => 'aaa' });
+    await runPsiCall({ url: 'https://example.com/', fetchImpl: impl, cacheBustIdImpl: () => 'bbb' });
+
+    const requested = seen.map((u) => new URL(u).searchParams.get('url'));
+    expect(requested[0]).toBe('https://example.com/?psi_nonce=aaa');
+    expect(requested[1]).toBe('https://example.com/?psi_nonce=bbb');
+    expect(requested[0]).not.toBe(requested[1]);
+  });
+
+  it('appends with & when the target URL already has a query string', async () => {
+    const seen: string[] = [];
+    const impl = (async (input: string) => {
+      seen.push(String(input));
+      return fakeResponse(fixtureRaw);
+    }) as unknown as typeof fetch;
+
+    await runPsiCall({ url: 'https://example.com/p?page=2', fetchImpl: impl, cacheBustIdImpl: () => 'x' });
+
+    expect(new URL(seen[0]).searchParams.get('url')).toBe('https://example.com/p?page=2&psi_nonce=x');
+  });
+
+  it('keeps the reported url clean and exposes the busted url separately', async () => {
+    const impl = (async () =>
+      fakeResponse({ ...fixtureRaw, analysisUTCTimestamp: '2026-01-01T00:00:00.000Z' })) as unknown as typeof fetch;
+
+    const result = await runPsiCall({ url: 'https://example.com/', fetchImpl: impl, cacheBustIdImpl: () => 'zz' });
+
+    expect(result.url).toBe('https://example.com/');
+    expect(result.requestedUrl).toBe('https://example.com/?psi_nonce=zz');
+    expect(result.analysisUTCTimestamp).toBe('2026-01-01T00:00:00.000Z');
+  });
+
+  it('leaves the url untouched when cache busting is disabled', async () => {
+    const seen: string[] = [];
+    const impl = (async (input: string) => {
+      seen.push(String(input));
+      return fakeResponse(fixtureRaw);
+    }) as unknown as typeof fetch;
+
+    const result = await runPsiCall({ url: 'https://example.com/', fetchImpl: impl, cacheBust: false });
+
+    expect(new URL(seen[0]).searchParams.get('url')).toBe('https://example.com/');
+    expect(result.requestedUrl).toBe('https://example.com/');
+  });
+
+  it('reports a null timestamp when the response omits one', async () => {
+    const impl = (async () => fakeResponse({ lighthouseResult: {} })) as unknown as typeof fetch;
+    const result = await runPsiCall({ url: 'https://example.com/', fetchImpl: impl });
+    expect(result.analysisUTCTimestamp).toBeNull();
   });
 });

@@ -19,6 +19,7 @@ loadEnv();
 const FILTER_GROUPS = ['opportunity', 'diagnostic', 'passed', 'informative'] as const;
 const SORT_FIELDS = ['savingsMs', 'savingsBytes', 'score'] as const;
 const ORDERS = ['asc', 'desc'] as const;
+const PARTIES = ['any', 'first', 'third'] as const;
 
 const CACHE_TTL_MS = 10 * 60 * 1000;
 
@@ -74,6 +75,7 @@ const filterParams = z.object({
   search: z.string().optional(),
   id: csv().optional(),
   hasItems: boolish.optional(),
+  party: z.enum(PARTIES).default('any'),
   sortBy: z.enum(SORT_FIELDS).default('savingsMs'),
   order: z.enum(ORDERS).default('desc'),
   limit: numericParam.pipe(z.number().int().min(0)).optional(),
@@ -208,6 +210,7 @@ function insightsPayload(report: AggregatedReport, filters: FilterParams) {
     search: filters.search,
     id: filters.id as string[] | undefined,
     hasItems: filters.hasItems,
+    party: filters.party,
     sortBy: filters.sortBy as SortField,
     order: filters.order as SortOrder,
     limit: filters.limit,
@@ -239,7 +242,9 @@ const insightsBody = z.object({
   runs: z.coerce.number().int().min(1).max(MAX_RUNS).default(10),
   stat: z.enum(STATS).default('median'),
   force: boolish.default(false),
-  filters: filterParams.partial({ sortBy: true, order: true, includeFlaky: true }).optional(),
+  filters: filterParams
+    .partial({ sortBy: true, order: true, includeFlaky: true, party: true })
+    .optional(),
 });
 
 export function buildServer(): FastifyInstance {

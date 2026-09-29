@@ -10,6 +10,11 @@ function insight(id: string, extra: Partial<Insight> = {}): AggregatedInsight {
     score: 0.5,
     scoreDisplayMode: 'numeric',
     group: 'diagnostic',
+    savingsMs: null,
+    savingsBytes: null,
+    firstPartyItems: 0,
+    thirdPartyItems: 0,
+    itemHosts: [],
     appearedInRuns: 10,
     runsSucceeded: 10,
     flaky: false,
@@ -154,9 +159,9 @@ describe('filterInsights', () => {
       const result = filterInsights(sample, { sortBy: 'savingsMs', order: 'asc' });
       expect(result[0]?.id).toBe('flaky-thing'); // 50ms, the smallest saving
       // Anything without a savings figure is pushed past every real number.
-      const undefinedAt = result.findIndex((i) => i.savingsMs === undefined);
-      expect(undefinedAt).toBeGreaterThan(0);
-      expect(result.slice(undefinedAt).every((i) => i.savingsMs === undefined)).toBe(true);
+      const unknownAt = result.findIndex((i) => i.savingsMs === null);
+      expect(unknownAt).toBeGreaterThan(0);
+      expect(result.slice(unknownAt).every((i) => i.savingsMs === null)).toBe(true);
     });
 
     it('sorts by savingsBytes', () => {
@@ -211,5 +216,35 @@ describe('filterInsights', () => {
       }),
     );
     expect(result).toEqual(['uses-responsive-images', 'render-blocking-resources']);
+  });
+});
+
+describe('party filter', () => {
+  const mixed: AggregatedInsight[] = [
+    insight('ours', { firstPartyItems: 3, thirdPartyItems: 0 }),
+    insight('theirs', { firstPartyItems: 0, thirdPartyItems: 4 }),
+    insight('unattributed', { firstPartyItems: 0, thirdPartyItems: 0 }),
+  ];
+
+  it('keeps everything by default', () => {
+    expect(filterInsights(mixed, {})).toHaveLength(3);
+    expect(filterInsights(mixed, { party: 'any' })).toHaveLength(3);
+  });
+
+  it('party=first drops insights charged to other people, keeps unattributed ones', () => {
+    const ids = filterInsights(mixed, { party: 'first' }).map((i) => i.id);
+    expect(ids).toContain('ours');
+    expect(ids).toContain('unattributed');
+    expect(ids).not.toContain('theirs');
+  });
+
+  it('party=third keeps only foreign-host cost', () => {
+    const ids = filterInsights(mixed, { party: 'third' }).map((i) => i.id);
+    expect(ids).toEqual(['theirs']);
+  });
+
+  it('composes with the other filters', () => {
+    expect(filterInsights(mixed, { party: 'first', group: ['diagnostic'] })).toHaveLength(2);
+    expect(filterInsights(mixed, { party: 'first', group: ['opportunity'] })).toHaveLength(0);
   });
 });

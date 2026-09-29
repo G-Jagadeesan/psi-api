@@ -42,12 +42,20 @@ export interface Insight {
   numericValue?: number;
   numericUnit?: string;
   group: InsightGroup;
-  savingsMs?: number;
-  savingsBytes?: number;
+  /** Null means "Lighthouse gave no estimate" - which is not the same as zero. */
+  savingsMs: number | null;
+  /** Null means "Lighthouse gave no estimate" - which is not the same as zero. */
+  savingsBytes: number | null;
   metricsAffected?: string[];
   items?: unknown[];
   /** Raw `details.items` length before trimming to the top 25. */
   itemsTotal?: number;
+  /** Items whose resource is served from the measured site's own domain. */
+  firstPartyItems: number;
+  /** Items whose resource is served from someone else's domain. */
+  thirdPartyItems: number;
+  /** Distinct hosts behind the items, capped for readability. */
+  itemHosts: string[];
 }
 
 /** CrUX field data, passed through untouched when the origin has real users. */
@@ -84,8 +92,8 @@ export type StatTriple = Record<Stat, number>;
 
 export interface AggregatedInsightStats {
   score: StatTriple;
-  savingsMs: StatTriple;
-  savingsBytes: StatTriple;
+  savingsMs: StatTriple | null;
+  savingsBytes: StatTriple | null;
 }
 
 export interface AggregatedInsight extends Insight {
@@ -147,6 +155,13 @@ export interface AggregatedReport {
 export type SortField = 'savingsMs' | 'savingsBytes' | 'score';
 export type SortOrder = 'asc' | 'desc';
 
+/**
+ * Which side of the wire an insight's cost sits on.
+ * `first` keeps insights with no foreign-host cost, including ones Lighthouse
+ * could not attribute to a URL at all - those are often the app's own code.
+ */
+export type PartyFilter = 'any' | 'first' | 'third';
+
 export interface InsightFilters {
   group?: FilterGroup[];
   minSavingsMs?: number;
@@ -156,6 +171,8 @@ export interface InsightFilters {
   search?: string;
   id?: string[];
   hasItems?: boolean;
+  /** Default `any`. */
+  party?: PartyFilter;
   sortBy?: SortField;
   order?: SortOrder;
   limit?: number;
