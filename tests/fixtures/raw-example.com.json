@@ -1,0 +1,643 @@
+{
+  "id": "https://example.com/",
+  "loadingExperience": {
+    "id": "https://example.com/",
+    "metrics": {
+      "largest_contentful_paint": {
+        "percentile": 75,
+        "distributions": [
+          {
+            "min": 0,
+            "max": 2500,
+            "proportion": 0.72
+          }
+        ]
+      },
+      "cumulative_layout_shift": {
+        "percentile": 75,
+        "distributions": [
+          {
+            "min": 0,
+            "max": 0.1,
+            "proportion": 0.9
+          }
+        ]
+      },
+      "interaction_to_next_paint": {
+        "percentile": 75,
+        "distributions": [
+          {
+            "min": 0,
+            "max": 200,
+            "proportion": 0.95
+          }
+        ]
+      }
+    },
+    "overall_category": "performance",
+    "origin_fallback_page": false
+  },
+  "originLoadingExperience": {
+    "id": "https://example.com",
+    "metrics": {
+      "largest_contentful_paint": {
+        "percentile": 75,
+        "distributions": [
+          {
+            "min": 0,
+            "max": 3000,
+            "proportion": 0.68
+          }
+        ]
+      }
+    },
+    "overall_category": "performance"
+  },
+  "lighthouseResult": {
+    "requestedUrl": "https://example.com/",
+    "finalDisplayedUrl": "https://example.com/",
+    "finalUrl": "https://example.com/",
+    "fetchTime": "2026-09-29T10:30:00.000Z",
+    "gatherMode": "navigation",
+    "lighthouseVersion": "12.2.1",
+    "userAgent": "Mozilla/5.0 (Linux; Android 11; moto g power (2022)) Chrome/125.0.0.0",
+    "categories": {
+      "performance": {
+        "id": "performance",
+        "title": "Performance",
+        "score": 0.58,
+        "auditRefs": [
+          {
+            "id": "first-contentful-paint",
+            "weight": 10,
+            "group": "metrics"
+          },
+          {
+            "id": "largest-contentful-paint",
+            "weight": 25,
+            "group": "metrics"
+          },
+          {
+            "id": "total-blocking-time",
+            "weight": 30,
+            "group": "metrics"
+          },
+          {
+            "id": "cumulative-layout-shift",
+            "weight": 25,
+            "group": "metrics"
+          },
+          {
+            "id": "speed-index",
+            "weight": 10,
+            "group": "metrics"
+          },
+          {
+            "id": "render-blocking-resources",
+            "weight": 0,
+            "group": "diagnostics"
+          },
+          {
+            "id": "unused-javascript",
+            "weight": 0,
+            "group": "diagnostics"
+          },
+          {
+            "id": "third-party-summary",
+            "weight": 0,
+            "group": "diagnostics",
+            "relevantAudits": [
+              "largest-contentful-paint",
+              "total-blocking-time"
+            ]
+          },
+          {
+            "id": "font-display-insight",
+            "weight": 0,
+            "group": "diagnostics"
+          },
+          {
+            "id": "image-delivery-insight",
+            "weight": 0,
+            "group": "diagnostics"
+          },
+          {
+            "id": "uses-responsive-images",
+            "weight": 0,
+            "group": "diagnostics"
+          },
+          {
+            "id": "legacy-javascript",
+            "weight": 0,
+            "group": "budgets"
+          },
+          {
+            "id": "uses-text-compression",
+            "weight": 0,
+            "group": "diagnostics"
+          },
+          {
+            "id": "viewport",
+            "weight": 0,
+            "group": "diagnostics"
+          },
+          {
+            "id": "interactive",
+            "weight": 0,
+            "group": "hidden"
+          },
+          {
+            "id": "bfcache",
+            "weight": 0,
+            "group": "hidden"
+          }
+        ]
+      }
+    },
+    "audits": {
+      "first-contentful-paint": {
+        "id": "first-contentful-paint",
+        "title": "First Contentful Paint",
+        "description": "First Contentful Paint marks the time at which the first text or image is painted.",
+        "score": 0.99,
+        "scoreDisplayMode": "numeric",
+        "displayValue": "1.2 s",
+        "numericValue": 1234,
+        "numericUnit": "millisecond"
+      },
+      "largest-contentful-paint": {
+        "id": "largest-contentful-paint",
+        "title": "Largest Contentful Paint",
+        "description": "Largest Contentful Paint marks the time at which the largest text or image is painted.",
+        "score": 0.58,
+        "scoreDisplayMode": "numeric",
+        "displayValue": "3.2 s",
+        "numericValue": 3210,
+        "numericUnit": "millisecond",
+        "details": {
+          "type": "filmstrip",
+          "metricSavings": {
+            "LCP": 820
+          }
+        }
+      },
+      "total-blocking-time": {
+        "id": "total-blocking-time",
+        "title": "Total Blocking Time",
+        "description": "Sum of all time periods between FCP and Time to Interactive.",
+        "score": 1,
+        "scoreDisplayMode": "numeric",
+        "displayValue": "90 ms",
+        "numericValue": 90,
+        "numericUnit": "millisecond"
+      },
+      "cumulative-layout-shift": {
+        "id": "cumulative-layout-shift",
+        "title": "Cumulative Layout Shift",
+        "description": "Cumulative Layout Shift measures the movement of visible elements.",
+        "score": 1,
+        "scoreDisplayMode": "numeric",
+        "displayValue": "0.02",
+        "numericValue": 0.02
+      },
+      "speed-index": {
+        "id": "speed-index",
+        "title": "Speed Index",
+        "description": "Speed Index shows how quickly the contents of a page are visibly populated.",
+        "score": 0.71,
+        "scoreDisplayMode": "numeric",
+        "displayValue": "3.8 s",
+        "numericValue": 3810,
+        "numericUnit": "millisecond"
+      },
+      "interactive": {
+        "id": "interactive",
+        "title": "Time to Interactive",
+        "description": "Time to Interactive marks the longest network response plus rendering.",
+        "score": null,
+        "scoreDisplayMode": "informative",
+        "displayValue": "4.2 s",
+        "numericValue": 4200,
+        "numericUnit": "millisecond"
+      },
+      "server-response-time": {
+        "id": "server-response-time",
+        "title": "Initial server response time",
+        "description": "Keep the server response time for the main document short.",
+        "score": 1,
+        "scoreDisplayMode": "metricSavings",
+        "displayValue": "Root document took 180 ms",
+        "numericValue": 180,
+        "numericUnit": "millisecond"
+      },
+      "render-blocking-resources": {
+        "id": "render-blocking-resources",
+        "title": "Eliminate render-blocking resources",
+        "description": "Resources are blocking the first paint of your page.",
+        "score": 0.34,
+        "scoreDisplayMode": "numeric",
+        "displayValue": "Potential savings of 640 ms",
+        "numericValue": 640,
+        "numericUnit": "millisecond",
+        "metricSavings": {
+          "FCP": 320,
+          "LCP": 640
+        },
+        "details": {
+          "type": "opportunity",
+          "overallSavingsMs": 640,
+          "overallSavingsBytes": 153600,
+          "items": [
+            {
+              "url": "https://example.com/assets/app.css",
+              "totalBytes": 102400,
+              "wastedMs": 320
+            },
+            {
+              "url": "https://fonts.googleapis.com/css2?family=DM+Sans",
+              "totalBytes": 51200,
+              "wastedMs": 320
+            }
+          ]
+        }
+      },
+      "unused-javascript": {
+        "id": "unused-javascript",
+        "title": "Reduce unused JavaScript",
+        "description": "Reduce unused JavaScript to deliver less bytes and reduce JavaScript execution time.",
+        "score": 0.42,
+        "scoreDisplayMode": "numeric",
+        "displayValue": "Potential savings of 380 ms",
+        "numericValue": 380,
+        "numericUnit": "millisecond",
+        "metricSavings": {
+          "LCP": 210
+        },
+        "details": {
+          "type": "opportunity",
+          "overallSavingsMs": 380,
+          "overallSavingsBytes": 210000,
+          "items": [
+            {
+              "url": "https://example.com/assets/vendor.js",
+              "totalBytes": 210000,
+              "wastedMs": 380
+            }
+          ]
+        }
+      },
+      "uses-responsive-images": {
+        "id": "uses-responsive-images",
+        "title": "Properly size images",
+        "description": "Serve images that are appropriately sized to save cellular data and improve load time.",
+        "score": 0,
+        "scoreDisplayMode": "numeric",
+        "displayValue": "Potential savings of 1.2 s",
+        "numericValue": 1200,
+        "numericUnit": "millisecond",
+        "metricSavings": {
+          "LCP": 1200
+        },
+        "details": {
+          "type": "opportunity",
+          "overallSavingsMs": 1200,
+          "overallSavingsBytes": 900000,
+          "items": [
+            {
+              "url": "https://example.com/assets/hero.jpg",
+              "totalBytes": 900000,
+              "wastedMs": 1200
+            }
+          ]
+        }
+      },
+      "lcp-lazy-loaded-insight": {
+        "id": "lcp-lazy-loaded-insight",
+        "title": "LCP request was lazy loaded",
+        "description": "The Largest Contentful Paint element was lazy loaded, delaying discovery of the resource.",
+        "score": null,
+        "scoreDisplayMode": "informative",
+        "metricSavings": {
+          "LCP": 1250
+        },
+        "details": {
+          "type": "list",
+          "items": [
+            {
+              "entity": "https://example.com/assets/hero.jpg",
+              "node": {
+                "snippet": "img.hero"
+              },
+              "wastedMs": 1250
+            }
+          ]
+        }
+      },
+      "font-display-insight": {
+        "id": "font-display-insight",
+        "title": "Text remains invisible while webfonts load",
+        "description": "Fonts are hidden until loaded, so text is invisible for a period of time.",
+        "score": null,
+        "scoreDisplayMode": "informative",
+        "details": {
+          "type": "list",
+          "items": [
+            {
+              "fontFamily": "DM Sans",
+              "display": "swap"
+            },
+            {
+              "fontFamily": "Jones",
+              "display": "block"
+            }
+          ]
+        }
+      },
+      "image-delivery-insight": {
+        "id": "image-delivery-insight",
+        "title": "Improve image delivery",
+        "description": "Compress and resize images to reduce the time they take to download.",
+        "score": 0.5,
+        "scoreDisplayMode": "metricSavings",
+        "displayValue": "Est savings of 2 KiB",
+        "details": {
+          "type": "table",
+          "items": [
+            {
+              "url": "https://example.com/assets/hero-1.jpg",
+              "totalBytes": 900000,
+              "wastedBytes": 100000,
+              "wastedMs": 100
+            },
+            {
+              "url": "https://example.com/assets/hero-2.jpg",
+              "totalBytes": 888000,
+              "wastedBytes": 99000,
+              "wastedMs": 98
+            },
+            {
+              "url": "https://example.com/assets/hero-3.jpg",
+              "totalBytes": 876000,
+              "wastedBytes": 98000,
+              "wastedMs": 96
+            },
+            {
+              "url": "https://example.com/assets/hero-4.jpg",
+              "totalBytes": 864000,
+              "wastedBytes": 97000,
+              "wastedMs": 94
+            },
+            {
+              "url": "https://example.com/assets/hero-5.jpg",
+              "totalBytes": 852000,
+              "wastedBytes": 96000,
+              "wastedMs": 92
+            },
+            {
+              "url": "https://example.com/assets/hero-6.jpg",
+              "totalBytes": 840000,
+              "wastedBytes": 95000,
+              "wastedMs": 90
+            },
+            {
+              "url": "https://example.com/assets/hero-7.jpg",
+              "totalBytes": 828000,
+              "wastedBytes": 94000,
+              "wastedMs": 88
+            },
+            {
+              "url": "https://example.com/assets/hero-8.jpg",
+              "totalBytes": 816000,
+              "wastedBytes": 93000,
+              "wastedMs": 86
+            },
+            {
+              "url": "https://example.com/assets/hero-9.jpg",
+              "totalBytes": 804000,
+              "wastedBytes": 92000,
+              "wastedMs": 84
+            },
+            {
+              "url": "https://example.com/assets/hero-10.jpg",
+              "totalBytes": 792000,
+              "wastedBytes": 91000,
+              "wastedMs": 82
+            },
+            {
+              "url": "https://example.com/assets/hero-11.jpg",
+              "totalBytes": 780000,
+              "wastedBytes": 90000,
+              "wastedMs": 80
+            },
+            {
+              "url": "https://example.com/assets/hero-12.jpg",
+              "totalBytes": 768000,
+              "wastedBytes": 89000,
+              "wastedMs": 78
+            },
+            {
+              "url": "https://example.com/assets/hero-13.jpg",
+              "totalBytes": 756000,
+              "wastedBytes": 88000,
+              "wastedMs": 76
+            },
+            {
+              "url": "https://example.com/assets/hero-14.jpg",
+              "totalBytes": 744000,
+              "wastedBytes": 87000,
+              "wastedMs": 74
+            },
+            {
+              "url": "https://example.com/assets/hero-15.jpg",
+              "totalBytes": 732000,
+              "wastedBytes": 86000,
+              "wastedMs": 72
+            },
+            {
+              "url": "https://example.com/assets/hero-16.jpg",
+              "totalBytes": 720000,
+              "wastedBytes": 85000,
+              "wastedMs": 70
+            },
+            {
+              "url": "https://example.com/assets/hero-17.jpg",
+              "totalBytes": 708000,
+              "wastedBytes": 84000,
+              "wastedMs": 68
+            },
+            {
+              "url": "https://example.com/assets/hero-18.jpg",
+              "totalBytes": 696000,
+              "wastedBytes": 83000,
+              "wastedMs": 66
+            },
+            {
+              "url": "https://example.com/assets/hero-19.jpg",
+              "totalBytes": 684000,
+              "wastedBytes": 82000,
+              "wastedMs": 64
+            },
+            {
+              "url": "https://example.com/assets/hero-20.jpg",
+              "totalBytes": 672000,
+              "wastedBytes": 81000,
+              "wastedMs": 62
+            },
+            {
+              "url": "https://example.com/assets/hero-21.jpg",
+              "totalBytes": 660000,
+              "wastedBytes": 80000,
+              "wastedMs": 60
+            },
+            {
+              "url": "https://example.com/assets/hero-22.jpg",
+              "totalBytes": 648000,
+              "wastedBytes": 79000,
+              "wastedMs": 58
+            },
+            {
+              "url": "https://example.com/assets/hero-23.jpg",
+              "totalBytes": 636000,
+              "wastedBytes": 78000,
+              "wastedMs": 56
+            },
+            {
+              "url": "https://example.com/assets/hero-24.jpg",
+              "totalBytes": 624000,
+              "wastedBytes": 77000,
+              "wastedMs": 54
+            },
+            {
+              "url": "https://example.com/assets/hero-25.jpg",
+              "totalBytes": 612000,
+              "wastedBytes": 76000,
+              "wastedMs": 52
+            },
+            {
+              "url": "https://example.com/assets/hero-26.jpg",
+              "totalBytes": 600000,
+              "wastedBytes": 75000,
+              "wastedMs": 50
+            },
+            {
+              "url": "https://example.com/assets/hero-27.jpg",
+              "totalBytes": 588000,
+              "wastedBytes": 74000,
+              "wastedMs": 48
+            },
+            {
+              "url": "https://example.com/assets/hero-28.jpg",
+              "totalBytes": 576000,
+              "wastedBytes": 73000,
+              "wastedMs": 46
+            },
+            {
+              "url": "https://example.com/assets/hero-29.jpg",
+              "totalBytes": 564000,
+              "wastedBytes": 72000,
+              "wastedMs": 44
+            },
+            {
+              "url": "https://example.com/assets/hero-30.jpg",
+              "totalBytes": 552000,
+              "wastedBytes": 71000,
+              "wastedMs": 42
+            }
+          ]
+        }
+      },
+      "uses-text-compression": {
+        "id": "uses-text-compression",
+        "title": "Enable text compression",
+        "description": "Text-based resources should be served with compression.",
+        "score": 1,
+        "scoreDisplayMode": "metricSavings",
+        "details": {
+          "type": "list",
+          "items": [
+            {
+              "url": "https://example.com/assets/app.js",
+              "totalBytes": 51200,
+              "wastedMs": 0
+            }
+          ]
+        }
+      },
+      "network-requests": {
+        "id": "network-requests",
+        "title": "Avoid enormous network payloads",
+        "description": "Large network payloads cost users real money and are highly correlated with long load times.",
+        "score": null,
+        "scoreDisplayMode": "informative",
+        "details": {
+          "type": "table",
+          "items": [
+            {
+              "url": "https://example.com/"
+            }
+          ]
+        }
+      },
+      "uses-http2": {
+        "id": "uses-http2",
+        "title": "Use HTTP/2",
+        "description": "HTTP/2 allows many requests over a single connection.",
+        "score": null,
+        "scoreDisplayMode": "notApplicable",
+        "details": {
+          "type": "table",
+          "items": []
+        }
+      },
+      "legacy-javascript": {
+        "id": "legacy-javascript",
+        "title": "Avoid legacy JavaScript",
+        "description": "Legacy polyfills and transforms inject code that browsers cannot always execute efficiently.",
+        "score": 0,
+        "scoreDisplayMode": "metricSavings",
+        "details": {
+          "type": "list",
+          "items": [
+            {
+              "url": "https://example.com/assets/polyfill.js"
+            }
+          ]
+        }
+      },
+      "third-party-summary": {
+        "id": "third-party-summary",
+        "title": "Reduce the impact of third-party code",
+        "description": "Third-party code can significantly impact load performance.",
+        "score": 0.6,
+        "scoreDisplayMode": "numeric",
+        "displayValue": "Main thread work: 1.1 s",
+        "details": {
+          "type": "list",
+          "items": [
+            {
+              "entity": "Other third parties"
+            }
+          ]
+        }
+      },
+      "viewport": {
+        "id": "viewport",
+        "title": "Has a `<meta name=\"viewport\">` tag",
+        "description": "A `viewport` not only optimizes rendering for mobile but also prevents a 300 ms delay to user input.",
+        "score": 1,
+        "scoreDisplayMode": "metricSavings"
+      },
+      "bfcache": {
+        "id": "bfcache",
+        "title": "Avoids page reloads on bfcache (Back/Forward Cache)",
+        "description": "Not every page is eligible for bfcache.",
+        "score": 0,
+        "scoreDisplayMode": "metricSavings",
+        "details": {
+          "type": "list",
+          "items": []
+        }
+      }
+    }
+  }
+}

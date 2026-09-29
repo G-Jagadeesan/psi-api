@@ -1,0 +1,18 @@
+{
+  "mobile": {
+    "score": 90,
+    "lcp": 2500,
+    "tbt": 200,
+    "cls": 0.1,
+    "fcp": 1800,
+    "speedIndex": 3400
+  },
+  "desktop": {
+    "score": 90,
+    "lcp": 1800,
+    "tbt": 150,
+    "cls": 0.1,
+    "fcp": 1200,
+    "speedIndex": 2400
+  }
+}
