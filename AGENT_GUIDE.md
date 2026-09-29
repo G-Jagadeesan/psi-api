@@ -4,7 +4,7 @@ This guide is for an **autonomous agent** driving a page toward a performance ta
 
 Read it end to end before your first run. The short version:
 
-> Measure with 10 runs. Pick the biggest failing insight. **Read `../sop-qwik.md` and obey it.** Make one small change. Deploy it — PSI measures a live public URL, so an undeployed change is not measurable. Measure again. Keep it only if the improvement beats the noise. Otherwise revert.
+> Measure with 10 runs. Pick the biggest failing insight. **Read `../sop-qwik.md` and obey it.** Make one small change. Open the page's staging PR, then wait 10 minutes and poll that PR every minute until the deploy settles — PSI measures a live public URL, so an undeployed change is not measurable. Measure again. Keep it only if the improvement beats the noise. Otherwise revert.
 
 The tool is read-only to you. You use it; you do not modify it.
 
@@ -17,9 +17,13 @@ The tool is read-only to you. You use it; you do not modify it.
 | Tool root | `psi-api/` |
 | Human docs | `psi-api/README.md` |
 | **Binding rules** | `sop-qwik.md` in the repo root — **read in full before your first code change** |
+| Same rules, repo form | `qwik-guvi/CLAUDE.md` (read it if you prefer the app-repo version) |
+| App rules, condensed | **Step 4 → "App rules a performance fix must not violate"** in this guide |
 | Targets | `psi-api/config/targets.json` |
 | Your log | `psi-api/data/<host>/optimization-log.md` |
 | App being optimized | `qwik-guvi/` |
+
+`sop-qwik.md` and `qwik-guvi/CLAUDE.md` carry overlapping content; where they differ, `sop-qwik.md` wins. This guide reproduces the parts of them that change what a Lighthouse-driven agent would otherwise get wrong, so you do not have to hold the whole SOP in your head mid-loop — but it is a subset, not a replacement. Read the SOP.
 
 Two rules that outrank everything else in this document:
 
@@ -112,14 +116,75 @@ Then, for the insight you picked, find the action it maps to:
 ```bash
 # take a class name, id, or URL fragment from the insight's items and search for it
 grep -rn "image__dam-img" src/
+grep -rn "static.cloudflareinsights.com" src/
 ```
 
 - **Grep finds it** → you have a file. Read it, confirm the insight describes the problem you found, then change it.
 - **Grep finds nothing** → the cost is not in code you own. Log it under "not actionable in repo" with the `itemHosts` that told you so, and move to the next insight. **Do not create a file to satisfy the audit, and do not edit a third party's script.**
 
-An insight that greps cleanly is a finding, not a task. On a real report of this project, `cache-insight` and `legacy-javascript-insight` both pointed at Cloudflare's beacon — high savings, zero greppable source.
+An insight that greps cleanly is a finding, not a task. On a real report of this project, `cache-insight` and `legacy-javascript-insight` both pointed at Cloudflare's beacon — high savings, zero greppable source, and a `resourceType: Script` attached so you know from the CLI output that the correct move is to disable the Cloudflare feature, not to edit a script.
+
+For third-party images, the `subItems` carry `resourceType: Image` and the full URL. If no `.node` selector is present, grep for the domain or a path fragment:
+
+```bash
+grep -rn "static.guvi.in" qwik-guvi/src/
+```
+
+This returns `certifications-and-placements.tsx:40` where a base URL plus a relative path is combined to build the third-party image URL. The agent must then read the surrounding code to understand the data flow.
+
+#### App rules a performance fix must not violate
+
+`sop-qwik.md` is binding and `qwik-guvi/CLAUDE.md` carries the same rules in repo form — read both. The `§N` references in the table above point at **`sop-qwik.md`** sections, not at this guide. What follows is the perf-relevant subset: the specific traps an agent falls into when it is optimising against a Lighthouse number.
+
+**Images — the most common trap**
+- **Never introduce a raw `<img>`.** First-fold images go through **Unpic** with explicit `src`, `width`, `height` and loading priority. Local assets: `import Img from './images/x.png?jsx'`.
+- Adding `width`/`height` to a raw `<img>` does not make that fix SOP-compliant. `src/` currently holds **56 raw `<img>` occurrences**; treat them as pre-existing debt, match the neighbour's pattern, and do not add more.
+- **Never change an element's existing `object-fit`.** `object-fill` / `object-cover` on card and background illustrations (e.g. `src/routes/enterprise/government/components/strategic-offerings.tsx`) must stay exactly as written. Swapping to `object-contain` "to prevent distortion" leaves white gaps and is an explicit CRITICAL violation. Both values are in wide use — 25 `object-fill`, 74 `object-contain` — so the rule is *do not change this element*, not *never write this value*.
+- `<picture>` only when desktop and mobile genuinely need different images, not for art direction to win a size.
+- **Never swap a custom Figma asset** (stars, badges, checkmarks, illustrations from `./images/`) for a Lucide icon from `~/components/lucide-icons/*` to save bytes unless it is pixel-identical. Fidelity beats byte count.
+- Below-fold images stay lazy; **the LCP image is never lazy loaded**.
+
+**Qwik — what actually ships JS**
+- **The first fold ships no JS except Qwik's own module-preload.**
+- `useVisibleTask$` is DOM-only work and is **never** allowed on the first fold. This codebase has **322 of them across 133 files**, including shared `src/components/` that render above the fold (`carousel`, `code-editor`, `awards-section`) — so "it is used everywhere" is not a defence. It requires `// eslint-disable-next-line qwik/no-use-visible-task`; adding or removing that suppression needs approval.
+- Prefer `useTask$` (177 uses) over `useVisibleTask$`, and `onInput$` / `onChange$` over `useTask$` for input reactions.
+- Static data is a plain module-level `const`. **Never a `useStore` for a static array** — a frequent cause of `forced-reflow-insight` and `bootup-time`.
+- Handlers are defined separately and bound (`onClick$={handler}`). No inline JS in JSX.
+- DOM access through `useSignal<HTMLElement>()` refs, never `getElementById`.
+- **No `routeAction$` / `<Form>` / `server$`.** The tree currently has **0** `routeAction$`. Data is `routeLoader$` → generated `useX` hooks; forms POST via `post()` in `~/utils/steroid.tsx`.
+- **No client-side navigation between routes.**
+- **A component you create and never use must be deleted or fully commented out — Qwik builds exported components even when unused, so an orphan export costs real bytes.** This is directly on the critical path for `unused-javascript`.
+- Styling belongs in colocated `*.module.css` or `?inline` with `useStylesScoped$` — not inline styles or JSX `style` props. No arbitrary Tailwind values (`w-[313px]`).
+
+**Libraries — the `unused-javascript` fix is import timing, not deletion**
+- Already in the tree: `ace-builds`, `mermaid`, `@ricky0123/vad-web`, `hls.js`, `plyr`, `swiper`, `canvas-confetti`, `jspdf`, plus `onnxruntime-web` via vad-web.
+- **Dynamic-import them at the point of use.** Do not delete a library to shrink a bundle, do not add one, and **never change a dependency version** to win a number. No new package without senior approval.
+- Qwik chunk names are content hashes (`build/q-TYxvsI7E.js`) and do not map to source files — use the build manifest, not grep, to attribute a chunk.
+
+**Styling, motion, a11y — do not trade a11y for CLS**
+- On-token colours only, in the correct territory: brand green `#0dba4b`, AI purple `#6729ff`, practice green-on-dark `#0ae056`/`#56f68f` on `#0a0f14`. A new value updates `tailwind.config.js` + `src/global.css` + `DESIGN.md` together.
+- Mobile-first; **verify every change at 375 / 576 / 768 / 992 / 1200.** Avoid `max-width` queries.
+- GPU-only motion: `translate` / `scale` / `opacity`, never layout properties on the main path. **Exception: accordions/FAQ may transition `grid-template-rows` `0fr↔1fr` plus the needed padding — keep it.**
+- WCAG AA contrast, always-visible focus rings (never bare `outline: none`), honour `prefers-reduced-motion`, touch targets ≥44px, no orphan hover on touch.
+
+**Stack facts you need**
+- Node **18.17.0** (`.node-version`), Vite 5, npm `legacy-peer-deps`, TS strict, alias `~/*` → `./src/*`, jsx `@builder.io/qwik`, Qwik `^1.16.0`.
+- Tailwind `^3.3.5` + DaisyUI `^4.3.1`, single `light` theme, `primary #0dba4b`; fonts DM Sans + Jones; type `h1 2.5rem → h6 1rem` at 700/1.2; radius `0.25rem`.
+- All config is public build-time `VITE_*`. **Never commit `.env` secrets.**
+- Deploy: Cloudflare Pages primary (`npm run deploy`), plus AWS Lambda / Express / Docker→ECS. CI is CodeBuild (`buildspec.yml`).
+- Reference component: `src/components/toast/toast.tsx`. Icons: `src/components/lucide-icons/`.
+
+**Testing — a green build is not a regression check**
+- The repo is effectively untested: one stale Playwright spec, no unit tests, and CI runs none. Do not treat the suite as a safety net. Verify with `build.types` + `lint` + `fmt.check` and confirm the change in a browser at the breakpoints above.
+- Gates are mandatory even for small work: `brainstorming` → `plan-eng-review` (Gate 1) → `review` (Gate 2) → `verification-before-completion`, then `qa` + `canary` after deploy.
+
+**Two stale references in the upstream docs — know these, do not act on them**
+- Both `sop-qwik.md` §2 and `CLAUDE.md` say to read `graphify-out/GRAPH_REPORT.md` first for architecture questions and to run `graphify update .` after source edits. **That directory does not exist in this checkout.** Use the SOP's own architecture section; its absence is not a blocker and is not something to "fix".
+- `sop-qwik.md` §6 says "never use raw `<img>`" while 56 raw `<img>` occurrences exist in `src/`. The rule binds on new code; the existing ones are debt, not precedent.
 
 ### Step 5 — One change
+
+**Re-read the app rules in Step 4's "App rules a performance fix must not violate" before you touch a file.** Almost every wasted performance iteration on this project comes from a change that was genuinely faster and simultaneously broke an app rule — a raw `<img>`, a swapped `object-fit`, an orphaned export, a `useVisibleTask$` added above the fold.
 
 - Make **one focused change**, or one small cohesive group of changes that only make sense together.
 - Touch only the files the SOP permits for this fix.
@@ -138,24 +203,117 @@ Name the insight in the message so the log is traceable:
 perf: preload LCP hero image (lcp-discovery-insight)
 ```
 
-### Step 7 — Deploy. This is not optional.
+### Step 7 — Open the staging PR. This is not optional.
 
 **PSI measures a live public URL. A change that is not deployed is not measurable.** Measuring your local server measures nothing.
 
-Per SOP §2 and §10, `qwik-guvi` deploys to **Cloudflare Pages** as primary:
+Per SOP §2 and §10, `qwik-guvi` deploys to **Cloudflare Pages** as primary. Build and verify locally first:
 
 ```bash
 cd qwik-guvi
 npm run build          # must pass
 npm run build.types && npm run lint && npm run fmt.check
-npm run deploy         # wrangler pages deploy ./dist
 ```
 
-CI is **AWS CodeBuild (`buildspec.yml`)**, not GitHub Actions — pushing may be enough to deploy, or you may need to trigger the pipeline. Check `buildspec.yml` and confirm with a human if you are unsure which path this repo currently uses. Other supported targets per SOP §2: AWS Lambda, Express, Docker→ECS.
+Then push the branch and open a **staging PR for the page you are optimizing**:
 
-**Wait for the deployment to be live on the measured URL before measuring.** Caching layers (Cloudflare) can serve stale assets; if a measurement looks unchanged immediately after deploy, verify the new build is actually being served before concluding the change did nothing.
+```bash
+git push -u origin <branch>
+gh pr create --base development --head <branch> \
+  --title "perf: <what changed> (<insight-id>) on <page>" \
+  --body "<page>, <insight-id>, baseline median, expected effect, revert plan>"
+```
 
-### Step 8 — Re-measure and decide
+One staging PR per page being optimized. If a staging PR for this page is already open, push to that branch instead of opening a second one.
+
+CI is **AWS CodeBuild (`buildspec.yml`)**, not GitHub Actions, and `qwik-guvi/.github/` currently contains only `CODEOWNERS` — there are no workflow files. So `gh pr checks` may legitimately report *no checks*; that is not a failure to fix, it means the pipeline is elsewhere. Confirm which pipeline the branch actually triggers, and ask a human if you cannot tell. Never invent a workflow file to make polling return something.
+
+> #### ⛔ Do not push while staging is building
+>
+> **Once a build is in flight, the branch is frozen until it reaches a terminal conclusion.** Pushing again mid-build is the one thing you must never do here, because it damages the shared staging server rather than just your own measurement:
+>
+> - It **cancels or restarts the in-flight build**, so the previous attempt never completes.
+> - It can leave staging **serving a half-applied deploy** — a new HTML shell pointing at assets that were never uploaded, or a mix of old and new chunks. That breaks the staging site for **everyone** using it, not just you.
+> - The resulting `500`s or missing-chunk errors look like a performance regression and will send you chasing a fix that does not exist.
+> - It wastes the entire poll cycle you already burned.
+>
+> **The rule:** between the first push and the terminal conclusion of that build, `git push` is forbidden. Do not "just add a small fix", do not amend, do not force-push, do not merge `development` in. Compose those changes locally and push **once**, after the build has settled.
+>
+> **"In progress" vs "settled" — the distinction that matters:**
+>
+> | Run state | Meaning | May you push? |
+> | --- | --- | --- |
+> | `status: in_progress`, `queued`, `waiting`, `pending` | build is live | **No.** Wait it out. |
+> | `conclusion: success` | build finished, staging is stable | Yes |
+> | `conclusion: failure` | build finished and failed, nothing partial is live | Yes — fix, push, restart the 10-minute wait |
+> | `conclusion: cancelled` | someone or something stopped it | Yes — but find out why first |
+> | no run visible at all | pipeline not tracked by Actions | Treat as in progress until the staging URL stops changing |
+>
+> A *failed* build is terminal, so pushing a fix after it is fine. An *in-flight* build is not. When you are unsure which state you are in, the safe action is always to wait.
+>
+> This also applies to merging `development` into your branch (SOP §10.2). Do that merge **after** the current build settles, never mid-build.
+
+### Step 8 — Wait 10 minutes, then poll the staging PR every minute
+
+The deploy needs time to build and propagate through the CDN. **Do not measure before the staging deploy is live** — a measurement taken against a stale edge is a false negative, and you will revert a change that actually worked.
+
+**Phase 1 — wait a flat 10 minutes before the first poll.** Do not poll earlier, do not poll faster:
+
+```bash
+sleep 600
+```
+
+**Phase 2 — poll once per minute until the PR's deploy settles.** Get the staging PR number from GitHub, then loop at a 60-second cadence:
+
+```bash
+# the staging PR number for this page's branch (verified working form)
+PR=$(gh pr list --head <branch> --state open --json number,url \
+       --jq '.[0] | "PR #\(.number) \(.url)"')
+echo "$PR"
+PR=${PR##*#}; PR=${PR%% *}
+
+# poll every 60s
+while :; do
+  echo "--- $(date -u +%H:%M:%SZ) polling PR #$PR ---"
+  gh pr checks "$PR" || true          # prints check name + state
+  gh run list --branch <branch> --limit 3 \
+    --json databaseName,status,conclusion \
+    --jq '.[] | "\(.databaseName): \(.status)/\(.conclusion // "-")"' || true
+  # break out when the deploy is done: checks are all green/failed and a run has concluded
+  if gh run list --branch <branch> --limit 1 --json conclusion \
+       --jq '.[0].conclusion != null' | grep -q true; then
+    echo "deploy settled"; break
+  fi
+  sleep 60
+done
+```
+
+**Expect these two commands to come back empty on this repo.** `qwik-guvi/.github/` holds only `CODEOWNERS`, there are no workflow files, and `gh run list` is verified to return nothing while `buildspec.yml` (AWS CodeBuild) is the real pipeline. An empty `gh run list` is information, not an error:
+
+- If `gh pr checks` lists checks → poll those until terminal, as above.
+- If both are empty → the deploy is **not** tracked by GitHub Actions. Fall back to polling the staging URL itself once a minute, checking whether the new build hash is live, and confirm the pipeline with a human. Do **not** add a workflow file to make the commands return something.
+
+Rules for the poll:
+
+- **Exactly one poll per minute.** No tight loop, no hammering the API, no `sleep 5`.
+- **Stop when the run reaches a terminal conclusion** — `success`, `failure`, or `cancelled`. Then read the logs, do not just trust the conclusion.
+- **The build is frozen while you poll. Do not push.** See "Do not push while staging is building" above. If you find a problem mid-poll, write it down and wait — do not act on it.
+- **On failure, read why before retrying:** `gh run view <run-id> --log-failed`. A failed build is terminal, so you may then fix, push, and restart the whole 10-minute wait. Never push *while* it is still in progress.
+- **Never cancel a running build** to "get a clean start". Cancelling leaves staging in a worse state than waiting would have.
+- **Cap the wait at 30 polls (30 minutes).** Past that, the deploy is stuck or the pipeline is not firing — report BLOCKED with the last poll output instead of polling forever.
+- **Never measure while a poll shows work still in progress.** An in-flight deploy means the URL may serve two different builds.
+
+If the staging URL starts returning errors, a `500`, or the shell loads while chunks 404, the deploy is broken. **Stop and report it** — do not push a revert on top of an unknown state, because that pushes on top of a possibly broken build.
+
+Once the poll settles green, confirm the measured URL is actually serving the new build before measuring:
+
+```bash
+curl -s https://<staging-host>/<page>/ | grep -oE 'build/q-[A-Za-z0-9_-]+\.js' | head -3
+```
+
+A changed chunk hash confirms the new build is live. An unchanged hash means the edge is still serving the old deploy — keep waiting.
+
+### Step 9 — Re-measure and decide
 
 ```bash
 npm run psi -- https://www.guvi.co/ --runs 10 --stat median --strategy mobile
@@ -173,7 +331,7 @@ Use the **baseline's `stddev`** as the noise band — it is the same measurement
 
 Also check the target metric you were actually fixing, not just the score. A change that trades LCP for CLS may leave the score flat while making things worse for users.
 
-### Step 9 — Log it
+### Step 10 — Log it
 
 Append to `psi-api/data/<host>/optimization-log.md`. **Append-only — never edit or delete earlier entries.**
 
@@ -184,13 +342,14 @@ Append to `psi-api/data/<host>/optimization-log.md`. **Append-only — never edi
 **Change made:** Added `fetchpriority="high"` to the Unpic hero image in
 `src/routes/learn/[courseId]/components/hero/hero.tsx`.
 **Commit:** `perf: preload LCP hero image (lcp-discovery-insight)` on `perf/lcp-hero`
+**Staging PR:** #1220 — polled 10 min after push, 60s cadence, settled green at 14:22Z
 **Baseline:**  median 27 (stddev 3.1)  LCP 16070ms  TBT 2127ms
 **After:**     median 31 (stddev 2.8)  LCP 14810ms  TBT 2102ms
 **Delta:**     +4.0 median (> 3.1 stddev)  LCP -1260ms
 **Verdict:**   KEPT
 ```
 
-### Step 10 — Repeat or stop
+### Step 11 — Repeat or stop
 
 Loop from Step 2. Stop when `meetsTarget` is `true`, or when you hit the iteration cap, or when you run out of SOP-permitted moves — in which case report what you found and what a human needs to decide.
 
@@ -213,6 +372,8 @@ Loop from Step 2. Stop when `meetsTarget` is `true`, or when you hit the iterati
 - Disable lint rules, skip tests, or skip the build.
 - Touch marketing copy.
 - Deploy to production on your own initiative without the SOP's deploy steps and human sign-off.
+- **Push to a branch whose staging build is still running.** The staging server is shared, so a mid-build push can leave it serving a half-applied deploy and break the site for everyone. Wait for a terminal conclusion. See "Do not push while staging is building" in Step 7.
+- **Cancel or restart a running staging build** in order to get a clean start.
 
 **If the tool itself looks broken** — a wrong number, a crash, a filter that returns nonsense — do not patch it. Report it with a reproduction and move on to the next insight, or stop. A broken measuring instrument must never be quietly adjusted to produce a number you like.
 
@@ -396,6 +557,43 @@ Useful flags: `--strategy desktop`, `--stat mean`, `--limit N`, `--search "third
 `--minSavingsMs 500`, `--id lcp-discovery-insight,image-delivery-insight`, `--no-save`, `--help`.
 Exit code is `0` on success and `1` on error.
 
+### 5.6 GitHub — find the staging PR and poll it
+
+Verified against `guvi-geek/qwik-guvi` on 2026-09-29, branch `perf-fix`:
+
+```bash
+$ gh pr list --head perf-fix --state open --json number,url,headRefName
+[{"headRefName":"perf-fix","number":1220,"url":"https://github.com/guvi-geek/qwik-guvi/pull/1220"}]
+
+$ gh run list --branch perf-fix --limit 3
+(no output — this repo has no GitHub Actions workflows)
+```
+
+So on this repo the staging PR number is discoverable, and the poll loop runs, but there is nothing for GitHub Actions to report. The build is CodeBuild via `buildspec.yml`. The agent's fallback is to poll the staging URL's build hash each minute, and to ask a human which pipeline the branch triggers.
+
+### 5.7 Why one push per settled build
+
+A correct timeline, and the mistake next to it:
+
+```
+14:10  push A                          build A starts
+14:12  push B   ← WRONG                build A cancelled, build B starts
+       └ staging may now serve A's shell with B's missing chunks
+14:20  run A/B concludes               only now is a push safe
+14:22  push C  (after the fix)         ok
+```
+
+```
+14:10  push A                          build A starts
+14:12  poll → in_progress              ⛔ no push
+14:13  poll → in_progress              ⛔ no push
+...
+14:20  poll → success                  build settled
+14:21  push B  (if still needed)       ok
+```
+
+The second timeline costs nothing but waiting. The first one can take staging down for every other user of that host, and the resulting 404s on chunks look like a performance regression rather than a deploy you broke.
+
 ---
 
 ## 6. Quick reference
@@ -406,6 +604,17 @@ npm run psi -- <url> --runs 10 --stat median --strategy mobile   # baseline
 npm run psi -- --reportId <id> --metric lcp --sortBy savingsMs   # free re-filter
 npm run --silent psi -- --reportId <id> --metric tbt --noFlaky --json  # machine output
 npm test                                                          # the tool's own tests
+```
+
+```bash
+# staging deploy: push, open the page's staging PR, then poll it
+git push -u origin <branch>                              # only when no build is in flight
+gh pr create --base development --head <branch> --title "perf: <what> (<insight-id>) on <page>"
+sleep 600                                    # flat 10 min before the first poll
+PR=$(gh pr list --head <branch> --state open --json number --jq '.[0].number')
+gh pr checks "$PR"                           # then repeat every 60s until the run concludes
+gh run view <run-id> --log-failed            # when a poll reports failure
+# ⛔ no git push until a poll reports a terminal conclusion (success/failure/cancelled)
 ```
 
 ```bash
@@ -421,9 +630,17 @@ curl http://127.0.0.1:3939/health
 - [ ] Work queue built with `--party first`, and every chosen insight grepped to a real file
 - [ ] Third-party findings logged as "not actionable in repo", not attempted
 - [ ] Every change maps to an action the SOP allows
-- [ ] One focused change, on a branch off `development`
+- [ ] No raw `<img>` introduced; no existing `object-fit` changed; no Figma asset swapped for an icon
+- [ ] No `useVisibleTask$` added to the first fold; no orphan exported component; no `routeAction$` / `server$`
+- [ ] No dependency added, removed, or version-bumped
+- [ ] Change verified in a browser at 375 / 576 / 768 / 992 / 1200, not just by a green build
+- [ ] One focused change, on a branch off `development`, rebased on latest `development` before final push
 - [ ] Commit message names the insight id, no AI attribution
-- [ ] Built, linted, typechecked, deployed, and confirmed live
+- [ ] Built, linted, typechecked
+- [ ] Staging PR opened for this page, number captured
+- [ ] **No push issued while a build was in progress** — branch frozen until terminal conclusion
+- [ ] Waited a flat 10 minutes, then polled every 60s until the deploy settled
+- [ ] Confirmed the new build hash is being served, not a stale edge
 - [ ] Re-measured with 10 runs
 - [ ] Improvement beat the baseline `stddev`, or the change was reverted
 - [ ] `optimization-log.md` appended

@@ -316,6 +316,84 @@ function detailItemsOf(details: unknown): unknown[] {
 }
 
 /**
+ * Third-party resources lack element-level data in Lighthouse's own rollup
+ * (`third-parties-insight` only has entity aggregates). To make them usable by
+ * an agent, we need to know which element loaded each resource so it can be
+ * removed or lazy-loaded. This helper builds a lookup from URL to element
+ * info by scanning every audit that records DOM nodes.
+ */
+function buildElementMap(audits: Record<string, RawAudit>): Map<string, { node?: unknown; resourceType?: string }> {
+  const elementAudits = [
+    'unsized-images',
+    'image-delivery-insight',
+    'render-blocking-insight',
+    'font-display-insight',
+  ];
+  const map = new Map<string, { node?: unknown; resourceType?: string }>();
+
+  // Populate from element-level audits
+  for (const id of elementAudits) {
+    const audit = audits[id];
+    if (!audit?.details) continue;
+    const items = detailItemsOf(audit.details);
+    for (const item of items) {
+      const url = asString((item as { url?: unknown }).url);
+      if (!url) continue;
+      const node = (item as { node?: unknown }).node;
+      if (node) {
+        const existing = map.get(url) || {};
+        existing.node = node;
+        map.set(url, existing);
+      }
+    }
+  }
+
+  // Add resourceType from network-requests. Lighthouse does not give element
+  // mapping here, but it knows the request type (Image, Script, etc.).
+  const network = audits['network-requests'];
+  if (network?.details) {
+    const items = detailItemsOf(network.details);
+    for (const item of items) {
+      const url = asString((item as { url?: unknown }).url);
+      if (!url) continue;
+      const rt = asString((item as { resourceType?: unknown }).resourceType);
+      if (rt) {
+        const existing = map.get(url) || {};
+        existing.resourceType = rt;
+        map.set(url, existing);
+      }
+    }
+  }
+
+  return map;
+}
+
+/**
+ * Walk an item (including nested subItems) and attach element info from the
+ * element map when a URL matches. Mutates in place.
+ */
+function enrichItemsWithElements(items: unknown[], elementMap: Map<string, { node?: unknown; resourceType?: string }>): void {
+  for (const item of items) {
+    if (!item || typeof item !== 'object') continue;
+    const record = item as Record<string, unknown>;
+    // Top-level URL (exists for most audits, but third-parties entities have none)
+    const url = asString(record.url);
+    if (url) {
+      const info = elementMap.get(url);
+      if (info) {
+        if (info.resourceType && !record.resourceType) record.resourceType = info.resourceType;
+        if (info.node && !record.node) record.node = info.node;
+      }
+    }
+    // Nested subItems (third-parties stores the actual resources here)
+    const subItems = (record.subItems as { items?: unknown[] } | undefined)?.items;
+    if (Array.isArray(subItems)) {
+      enrichItemsWithElements(subItems, elementMap);
+    }
+  }
+}
+
+/**
  * `third-parties-insight` exists precisely to list other people's code, so every
  * row is third party by definition - even though its rows carry an `entity` name
  * rather than a top-level URL.
@@ -460,6 +538,10 @@ export function normalizeReport(
     if (typeof ref?.id === 'string') refById.set(ref.id, ref);
   }
 
+  // Third-party resources come without element data. Correlate URLs from
+  // element-level audits so an agent knows where to cut or lazy-load them.
+  const elementMap = buildElementMap(audits);
+
   // Lighthouse echoes the URL it was actually given, cache-busting param and
   // all. Strip it so ownership is judged against the real site, and so nothing
   // downstream reports a URL the site never served.
@@ -526,6 +608,14 @@ export function normalizeReport(
     }
 
     insights.push(insight);
+  }
+
+  // Third-party item enrichment: attach element info (selector, snippet)
+  // wherever we were able to correlate a resource URL to an element-level audit.
+  for (const insight of insights) {
+    if (insight.thirdPartyItems > 0 && Array.isArray(insight.items)) {
+      enrichItemsWithElements(insight.items, elementMap);
+    }
   }
 
   return {

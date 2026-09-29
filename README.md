@@ -336,6 +336,19 @@ npm run psi -- <url> --party third
 
 `third-parties-insight` is treated as third party by definition, since every row in it is someone else's code.
 
+`third-parties-insight` is treated as third party by definition, since every row in it is someone else's code. For each resource under `subItems`, we attach:
+
+- `resourceType` — `Script`, `Image`, `Stylesheet`, `Font`, etc., read from Lighthouse's own network request log.
+- `node` — selector and snippet, **when Lighthouse already flagged that resource in an element-level audit** (render-blocking scripts, mis-sized images). If Lighthouse never recorded a selector, this field is absent and you must grep for the URL yourself.
+
+The grep gate applies:
+
+```bash
+grep -rn "static.guvi.in" qwik-guvi/src/
+```
+
+returns the component that builds those URLs so you can trace where they are referenced and decide whether to lazy-load or replace.
+
 ### "No estimate" is not "zero"
 
 `savingsMs` and `savingsBytes` are always present, and are `null` when Lighthouse gave no estimate. They used to be `0` or absent, interchangeably, which conflated two different facts:
@@ -494,3 +507,9 @@ To regenerate the fixture: `node scripts/make-fixture.js`.
 ## Automation
 
 See **[AGENT_GUIDE.md](./AGENT_GUIDE.md)** for how an autonomous agent should use this tool to drive a page to target in a measured, reversible loop.
+
+That loop requires a staging deploy per change, and the deploy rules matter as much as the measuring:
+
+- Open a **staging PR for the page** being optimized, wait a flat 10 minutes, then poll that PR once a minute until the build reaches a terminal conclusion.
+- **Never push to a branch while its staging build is running.** The staging server is shared — a mid-build push cancels the in-flight build and can leave the site serving a half-applied deploy, breaking it for everyone. Freeze the branch until the run concludes; a *failed* build is terminal, so pushing a fix after one is fine.
+- Confirm the new build hash is actually being served before measuring. A measurement against a stale edge is a false negative, and it will make you revert a change that worked.
