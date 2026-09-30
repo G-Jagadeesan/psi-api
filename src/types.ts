@@ -85,12 +85,62 @@ export interface FieldData {
   originLoadingExperience?: unknown;
 }
 
+/**
+ * How a run was actually measured, read back from Lighthouse's own report.
+ *
+ * This exists because a performance number without its measurement conditions is
+ * not interpretable. Two reports are only comparable when they were taken under
+ * the same conditions, and the device emulation, network throttling model, CPU
+ * benchmark and Lighthouse build are all chosen server-side by PSI - the caller
+ * cannot request them, so a stored report has to *record* them or the comparison
+ * has to be taken on trust.
+ *
+ * PSI echoes only part of its config, so every field here is what the response
+ * actually stated. Anything it omits is omitted here too rather than guessed:
+ * see `PSI_CONFIG_ECHOED_FIELDS` in `normalizeReport`.
+ */
+export interface RunEnvironment {
+  /** Lighthouse release that produced the run. */
+  lighthouseVersion: string;
+  /** What the metrics were emulated as: `mobile` or `desktop`. */
+  formFactor?: string;
+  /** Device class, when it differs from `formFactor` (always `mobile` here). */
+  emulatedFormFactor?: string;
+  /**
+   * Which CPU the run was scored against, as Lighthouse's `benchmarkIndex`.
+   *
+   * A higher number is a slower device. This is the single best predictor of
+   * whether two reports are comparable at all, and it is worth checking when a
+   * score moves for no reason you can find in the code.
+   */
+  benchmarkIndex?: number;
+  /**
+   * The user agent the page's network stack was emulated with, which names the
+   * actual device model (e.g. "moto g power (2022)").
+   */
+  networkUserAgent?: string;
+  /** The host that ran the audit, for provenance. */
+  hostUserAgent?: string;
+  /** PSI's release channel, e.g. `lr` (Lighthouse Runner). */
+  channel?: string;
+  /** Locale used for the audit. */
+  locale?: string;
+  /**
+   * The categories actually scored, e.g. `["performance"]`.
+   *
+   * A report is not a full Lighthouse run unless this is everything you expected.
+   */
+  categories?: string[];
+}
+
 export interface NormalizedReport {
   url: string;
   finalUrl: string;
   strategy: Strategy;
   fetchTime: string;
   lighthouseVersion: string;
+  /** How this run was measured, as Lighthouse reported it. */
+  environment: RunEnvironment;
   score: number;
   metrics: Metrics;
   insights: Insight[];
@@ -229,6 +279,14 @@ export interface AggregatedReport {
   runsSucceeded: number;
   generatedAt: string;
   lighthouseVersion: string;
+  /**
+   * How the run was measured, taken from the run closest to the median.
+   *
+   * One run describes the whole set: PSI runs them on identical infrastructure,
+   * so a per-run breakdown would only add noise. Taken from the median run
+   * because that is the run whose numbers the headline describes.
+   */
+  environment: RunEnvironment;
   /** Flattened chosen-stat values, for a caller that only wants one number. */
   headline: {
     score: number;

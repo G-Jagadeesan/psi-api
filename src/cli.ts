@@ -7,8 +7,30 @@ import { loadTargets } from './targets.js';
 import { loadReport, loadRuns, listReports, getDataDir, saveReport } from './storage.js';
 import { diffReanalyzed, reanalyze, type ReanalyzeDelta } from './reanalyze.js';
 import { STATS, STRATEGIES, type AggregatedReport, type MetricKey, type SortField, type SortOrder } from './types.js';
-import type { FilterGroup, InsightFilters } from './types.js';
+import type { FilterGroup, Gap, InsightFilters } from './types.js';
 import { UrlValidationError } from './psiClient.js';
+import {
+  ABSENT,
+  METRIC_ROWS,
+  barSegments,
+  colorEnabled,
+  environmentLine,
+  fit,
+  formatBytes,
+  lighthouseLabel,
+  metricDelta,
+  metricValue,
+  passCount,
+  paint,
+  renderTable,
+  savingsLabel,
+  shortenUrl,
+  spreadLine,
+  termWidth,
+  truncate,
+  wrap,
+  type Column,
+} from './render.js';
 
 loadEnv();
 
@@ -332,33 +354,100 @@ export function parseArgs(argv: string[]): CliOptions | null {
 
 /* -------------------------------- rendering --------------------------------- */
 
-const GREEN = '\u001b[32m';
-const RED = '\u001b[31m';
-const YELLOW = '\u001b[33m';
-const DIM = '\u001b[2m';
-const BOLD = '\u001b[1m';
-const RESET = '\u001b[0m';
-
-const color = (code: string, text: string, enabled: boolean) => (enabled ? `${code}${text}${RESET}` : text);
-
-function scoreColor(score: number, useColor: boolean): string {
-  if (score >= 90) return color(GREEN, String(score), useColor);
-  if (score >= 50) return color(YELLOW, String(score), useColor);
-  return color(RED, String(score), useColor);
-}
-
-function formatMs(value: number | undefined): string {
-  return value === undefined ? '-' : `${Math.round(value)}ms`;
-}
-
 /** Round for display, dropping the float noise Lighthouse reports in. */
 function round(value: number, decimals: number): number {
   const factor = 10 ** decimals;
   return Math.round(value * factor) / factor;
 }
 
-function pad(value: string, width: number): string {
-  return value.length >= width ? value.slice(0, width) : value.padEnd(width);
+/** Lighthouse's own score bands, so a score is coloured the way its own UI colours it. */
+function scorePaint(score: number, useColor: boolean): string {
+  const name = score >= 90 ? 'green' : score >= 50 ? 'yellow' : 'red';
+  return paint(name, String(score), useColor);
+}
+
+const GAP = 2;
+const INDENT = '  ';
+
+/**
+ * The two lines that identify the report, and the third that says what it means.
+ *
+ * The environment line is not decoration. A number measured against a different
+ * emulated CPU is a different number, and before this was recorded the only way
+ * to know the conditions was to take them on trust from the form factor.
+ */
+function header(report: AggregatedReport, useColor: boolean): string[] {
+  const width = termWidth() - INDENT.length;
+  return [
+    paint('bold', shortenUrl(report.url, width), useColor),
+    paint(
+      'dim',
+      [
+        report.strategy,
+        lighthouseLabel(report.lighthouseVersion),
+        `${report.stat} of ${report.runsSucceeded}/${report.runsRequested} runs`,
+        report.generatedAt.slice(0, 10),
+      ].join(' · '),
+      useColor,
+    ),
+    paint('dim', `measured under ${environmentLine(report.environment)}`, useColor),
+  ];
+}
+
+/**
+ * The one-sentence answer, before any of the evidence.
+ *
+ * A reader who stops after three lines should still know whether the page is
+ * healthy and what to do about it. "BELOW TARGET  fcp +354" answered neither:
+ * it did not say how many budgets were missed, and `+354` had no units.
+ */
+function verdict(report: AggregatedReport, useColor: boolean): string[] {
+  const gaps = report.targets.gaps;
+  const failing = gaps.filter((gap) => !gap.meets);
+  const lines: string[] = [];
+
+  const state = report.targets.meetsTarget
+    ? paint('green', 'PASS', useColor)
+    : paint('red', 'FAIL', useColor);
+  const scope = `${failing.length} of ${gaps.length} budget${gaps.length === 1 ? '' : 's'} failing`;
+  lines.push(`${paint('bold', 'VERDICT', useColor)}  ${state}  ${paint('dim', scope, useColor)}`);
+
+  // Name the failures in the order they hurt. `worstGap` is already ranked by
+  // relative overshoot, which is the only ranking that compares a 300ms TBT miss
+  // against a 0.02 CLS miss fairly.
+  const named = failing
+    .slice()
+    .sort((a, b) => overshoot(b) - overshoot(a))
+    .slice(0, 4)
+    .map((gap) => {
+      const label = METRIC_LABELS[gap.metric] ?? gap.metric.toUpperCase();
+      const count = passCount(gap);
+      const held = count === ABSENT ? '' : ` (${count} runs in budget)`;
+      return `${label} ${metricValue(gap.metric, gap.actual)} vs ${metricValue(gap.metric, gap.target)}${held}`;
+    });
+  if (named.length > 0) lines.push(`        ${paint('dim', named.join(', '), useColor)}`);
+
+  if (report.targets.medianPass && !report.targets.meetsTarget) {
+    lines.push(
+      paint(
+        'yellow',
+        '        every median is inside budget, but too few individual runs are - judged on the tail',
+        useColor,
+      ),
+    );
+  }
+  for (const reason of report.targets.blockedBy ?? []) {
+    for (const line of wrap(`not fixable from here: ${reason}`, termWidth() - 8, '        ')) {
+      lines.push(paint('yellow', `        ${line}`, useColor));
+    }
+  }
+  return lines;
+}
+
+/** How far past its own budget a metric is, as a fraction. Dimensionless on purpose. */
+function overshoot(gap: Gap): number {
+  if (gap.target <= 0) return gap.delta > 0 ? Number.POSITIVE_INFINITY : 0;
+  return gap.delta / gap.target;
 }
 
 /** Filters the CLI applies to a stored report. Shared by both renderers. */
@@ -381,117 +470,212 @@ function filtersFrom(options: CliOptions): InsightFilters {
   };
 }
 
+/**
+ * The graded-metric table, used verbatim by both views.
+ *
+ * `grow` sits on the id nowhere here because there is no free-text column: the
+ * numbers are the content, and squeezing them to make room for a longer label
+ * would be backwards.
+ */
+const BUDGET_COLUMNS: Column[] = [
+  { key: 'metric', label: 'METRIC', min: 11 },
+  { key: 'actual', label: 'MEDIAN', align: 'right', min: 8 },
+  { key: 'budget', label: 'BUDGET', align: 'right', min: 8 },
+  { key: 'delta', label: 'VERDICT', min: 13 },
+  { key: 'pass', label: 'RUNS IN BUDGET', align: 'right', min: 15 },
+  { key: 'bar', label: '', min: 12, max: 12 },
+];
+
+/**
+ * The metric table: every graded metric, its median, its budget, and how often
+ * real runs actually held it.
+ *
+ * All rows share one bar scale, taken from the largest value in the table, so a
+ * longer bar really is a worse metric. A bar scaled per row would make a 0.002
+ * CLS and a 3.4s speed index look identical, which is the exact confusion the
+ * table exists to prevent.
+ */
+function metricsTable(report: AggregatedReport, useColor: boolean): string[] {
+  const rows = METRIC_ROWS.filter((row) => report.headline.metrics[row.key] !== undefined);
+  if (rows.length === 0) return [];
+
+  const byMetric = new Map(report.targets.gaps.map((gap) => [gap.metric, gap]));
+  const entries = rows.map((row) => ({ ...row, gap: byMetric.get(row.key) }));
+  const scale = Math.max(
+    ...entries.map((entry) => Math.max(entry.gap?.actual ?? 0, entry.gap?.target ?? 0)),
+    1,
+  );
+
+  const columns: Column[] = BUDGET_COLUMNS;
+
+  return renderTable(columns, budgetCells(entries, scale, useColor), {    width: termWidth() - INDENT.length,
+    gap: GAP,
+    indent: INDENT,
+    styleLabel: (text) => paint('dim', text, useColor),
+  });
+}
+
+/**
+ * One row per metric, for both the default view and `--diagnose`.
+ *
+ * Shared deliberately: the two views answer different questions but grade the
+ * same budgets, and a reader who switches between them should not have to
+ * re-learn what the columns mean or re-read a differently-scaled bar.
+ */
+function budgetCells(
+  entries: Array<{ key: MetricKey; label: string; gap: Gap | undefined; actual?: number }>,
+  scale: number,
+  useColor: boolean,
+): string[][] {
+  return entries.map((entry) => {
+    const gap = entry.gap;
+    const actual = entry.actual ?? gap?.actual ?? 0;
+    const target = gap?.target ?? 0;
+    const meets = gap?.meets ?? true;
+    const bar = barSegments(actual, target, scale);
+    const barText =
+      paint(meets ? 'green' : 'red', bar.fill + bar.lead, useColor) +
+      paint('cyan', bar.tick, useColor) +
+      paint('dim', bar.rest, useColor);
+    return [
+      meets ? entry.label : paint('red', entry.label, useColor),
+      metricValue(entry.key, actual),
+      gap ? metricValue(entry.key, gap.target) : ABSENT,
+      gap
+        ? paint(meets ? 'green' : 'red', metricDelta(entry.key, gap.delta, gap.meets), useColor)
+        : ABSENT,
+      gap ? paint(passPaint(gap), passCount(gap), useColor) : ABSENT,
+      barText,
+    ];
+  });
+}
+
+/** Colour for a pass-rate cell: green only when every measured run held. */
+function passPaint(gap: Gap): 'green' | 'yellow' | 'red' {
+  if (gap.meets) return 'green';
+  if (gap.passRate !== undefined && gap.passRate >= 0.9) return 'yellow';
+  return 'red';
+}
+
+/**
+ * A wrapped SOP line, with the guide section picked out.
+ *
+ * The section number is what a reader scans for - it says which rule of the
+ * playbook the fix comes from - so it gets its own colour rather than being
+ * lost in a run of prose. The split is on the first run of two spaces, which
+ * the section reference never contains itself.
+ */
+function paintSop(line: string, useColor: boolean): string {
+  const split = /\s{2,}/.exec(line);
+  if (!split) return paint('dim', line, useColor);
+  const at = split.index;
+  return `${paint('cyan', line.slice(0, at), useColor)}  ${paint('dim', line.slice(at).trimStart(), useColor)}`;
+}
+
+const INSIGHT_COLUMNS: Column[] = [
+  { key: 'saving', label: 'EST. SAVING', align: 'right', min: 11 },
+  { key: 'id', label: 'INSIGHT', min: 16, grow: true },
+  { key: 'metrics', label: 'AFFECTS', min: 9 },
+  { key: 'ours', label: 'OURS', align: 'right', min: 5 },
+  { key: 'runs', label: 'SEEN', align: 'right', min: 7 },
+];
+
+/** One insight as table cells, with the savings column falling back to bytes. */
+function insightRow(insight: AggregatedReport['insights'][number], useColor: boolean): string[] {
+  const saving = savingsLabel(insight.savingsMs, insight.savingsBytes);
+  const affected = (insight.metricsAffected ?? []).map((m) => METRIC_LABELS[m] ?? m).join(' ');
+  const share = insight.firstPartyShare;
+  const shareText =
+    share === null || share === undefined
+      ? ABSENT
+      : share === 0
+        ? paint('dim', '0%', useColor)
+        : paint(share < 1 ? 'yellow' : 'green', `${Math.round(share * 100)}%`, useColor);
+  const runs = `${insight.appearedInRuns}/${insight.runsSucceeded}`;
+  return [
+    saving === ABSENT ? paint('dim', ABSENT, useColor) : saving,
+    insight.flaky ? paint('yellow', `${insight.id} (flaky)`, useColor) : insight.id,
+    affected || ABSENT,
+    shareText,
+    paint(insight.flaky ? 'yellow' : 'dim', runs, useColor),
+  ];
+}
+
 function renderHuman(options: CliOptions, report: Awaited<ReturnType<typeof runReport>>['report']): string {
   if (options.diagnose) return renderDiagnosis(report, options);
 
-  const useColor = process.stdout.isTTY === true && !process.env.NO_COLOR;
+  const useColor = colorEnabled();
   const insights = filterInsights(report.insights, filtersFrom(options));
+  const lines: string[] = ['', ...header(report, useColor), ''];
 
-  const lines: string[] = [];
-
-  lines.push('');
-  lines.push(`${color(BOLD, report.url, useColor)}  ${color(DIM, `[${report.strategy}]`, useColor)}`);
+  // Score, with the distribution beside it. A score with no spread next to it
+  // reads as a stable property of the page when it is a summary of ten noisy
+  // measurements, and "which lane is the page in" is the first question anyone
+  // asks when a number moves.
+  const scoreTarget = report.targets.targets.score;
+  const targetText =
+    scoreTarget === undefined ? '' : paint('dim', `  target ${scoreTarget}`, useColor);
+  const spread = spreadLine(report.score);
   lines.push(
-    `${color(DIM, 'score', useColor)} ${scoreColor(report.headline.score, useColor)}/100  ` +
-      `${color(DIM, `(${report.stat} of ${report.runsSucceeded}/${report.runsRequested} runs)`, useColor)}`,
+    `${paint('bold', 'SCORE', useColor)}    ${scorePaint(report.headline.score, useColor)} / 100` +
+      `${targetText}   ` +
+      paint('dim', spread, useColor),
   );
-
-  const metricLabels: Array<[MetricKey, string]> = [
-    ['lcp', 'LCP'],
-    ['tbt', 'TBT'],
-    ['cls', 'CLS'],
-    ['fcp', 'FCP'],
-    ['speedIndex', 'SI'],
-  ];
-  const metricsLine = metricLabels
-    .filter(([key]) => report.headline.metrics[key] !== undefined)
-    .map(([key, label]) => {
-      const raw = report.headline.metrics[key] as number;
-      const target = report.targets.targets[key];
-      const value = key === 'cls' ? raw.toFixed(3) : formatMs(raw);
-      const gap = report.targets.gaps.find((g) => g.metric === key);
-      const mark = target === undefined ? '' : gap?.meets ? ' ' : color(RED, '!', useColor);
-      return `${label} ${value}${mark}`;
-    })
-    .join('  ');
-  if (metricsLine) lines.push(metricsLine);
-
-  // Tail percentiles, because a budget describes real sessions rather than the
-  // middle of the distribution. On a page whose score splits into two lanes the
-  // p75 is the number that predicts what a user actually sees.
-  const spread = `spread: score p25 ${report.score.p25} p75 ${report.score.p75} p95 ${report.score.p95} · stddev ${report.score.stddev.toFixed(1)}`;
-  lines.push(color(DIM, spread, useColor));
   if (report.distributions?.score?.bimodal) {
-    lines.push(color(YELLOW, `  bimodal: ${report.distributions.score.note}`, useColor));
-  }
-
-  const status = report.targets.meetsTarget
-    ? color(GREEN, 'MEETS TARGET', useColor)
-    : color(RED, 'BELOW TARGET', useColor);
-  const failing = report.targets.gaps
-    .filter((gap) => !gap.meets)
-    .map((gap) => {
-      const delta = `${gap.delta > 0 ? '+' : ''}${gap.delta}`;
-      // Surface the pass rate next to any gap, since a median-only verdict hides
-      // runs that bust the budget.
-      const rate = gap.passRate === undefined ? '' : ` (${Math.round(gap.passRate * 100)}% of runs in budget)`;
-      return `${gap.metric} ${delta}${rate}`;
-    })
-    .join(' ');
-  lines.push(failing ? `${status}  ${color(DIM, failing, useColor)}` : status);
-
-  if (report.targets.medianPass && !report.targets.meetsTarget) {
     lines.push(
-      color(
-        YELLOW,
-        '  note: every median is inside budget, but too few individual runs are. Judged on the tail.',
-        useColor,
-      ),
+      paint('yellow', `         the score splits into two groups: ${report.distributions.score.note}`, useColor),
     );
   }
-  for (const reason of report.targets.blockedBy ?? []) {
-    lines.push(color(YELLOW, `  blocked: ${reason}`, useColor));
-  }
+  lines.push('');
+  lines.push(...verdict(report, useColor));
+  lines.push('');
+  lines.push(...metricsTable(report, useColor));
 
   lines.push('');
-  lines.push(color(BOLD, `INSIGHTS (${insights.length} of ${report.insights.length})`, useColor));
+  const total = report.insights.length;
+  const shown = insights.length;
+  lines.push(
+    paint('bold', 'FINDINGS', useColor) +
+      paint('dim', `  ${shown === total ? `${total}` : `${shown} of ${total}`} shown`, useColor),
+  );
   if (insights.length === 0) {
-    lines.push(color(DIM, '  nothing matched the given filters', useColor));
+    lines.push(paint('dim', `${INDENT}nothing matched the given filters`, useColor));
   } else {
     lines.push(
-      color(
-        DIM,
-        `  ${pad('SAVING', 9)}${pad('ID', 42)}${pad('GROUP', 15)}${pad('METRIC', 11)}ITEMS`,
-        useColor,
+      ...renderTable(
+        INSIGHT_COLUMNS,
+        insights.map((insight) => insightRow(insight, useColor)),
+        {
+          width: termWidth() - INDENT.length,
+          gap: GAP,
+          indent: INDENT,
+          styleLabel: (text) => paint('dim', text, useColor),
+        },
       ),
     );
-    for (const insight of insights) {
-      const saving =
-        insight.savingsMs !== null && insight.savingsMs > 0 ? formatMs(insight.savingsMs) : '-';
-      const affected = (insight.metricsAffected ?? []).slice(0, 2).join(',') || '-';
-      const items = insight.itemsTotal ?? insight.items?.length ?? 0;
-      lines.push(
-        `  ${pad(saving, 9)}${pad(insight.id, 42)}${pad(insight.group, 13)}${pad(affected, 9)}${items}` +
-          (insight.flaky ? color(YELLOW, ' flaky', useColor) : '') +
-          // Mixed findings are the ones `--party first` used to hide, so mark them.
-          (insight.firstPartyShare !== null && insight.firstPartyShare !== undefined && insight.firstPartyShare < 1
-            ? color(DIM, ` ${Math.round(insight.firstPartyShare * 100)}% first-party`, useColor)
-            : ''),
-      );
-    }
+  }
+  lines.push('');
+  lines.push(
+    paint('dim', `${INDENT}${ABSENT} in SAVING means Lighthouse gave no estimate, which is not zero.`, useColor),
+  );
+  lines.push(
+    paint('dim', `${INDENT}OURS is how much of the cost your own code is responsible for.`, useColor),
+  );
+  if (options.limit !== undefined && shown < total) {
+    lines.push(paint('dim', `${INDENT}${total - shown} more hidden by --limit ${options.limit}.`, useColor));
   }
 
   const failed = report.errors.filter((error) => error.message);
   if (failed.length > 0) {
     lines.push('');
-    lines.push(color(YELLOW, `${failed.length} run(s) failed:`, useColor));
+    lines.push(paint('yellow', `${INDENT}${failed.length} run(s) failed:`, useColor));
     for (const failure of failed.slice(0, 3)) {
-      lines.push(color(DIM, `  run ${failure.run}: ${failure.message}`, useColor));
+      lines.push(paint('dim', `${INDENT}${INDENT}run ${failure.run}: ${failure.message}`, useColor));
     }
   }
 
   lines.push('');
-  lines.push(color(DIM, `reportId ${report.reportId}`, useColor));
+  lines.push(paint('dim', `saved as reportId ${report.reportId}`, useColor));
   lines.push('');
   return lines.join('\n');
 }
@@ -504,7 +688,7 @@ function renderHuman(options: CliOptions, report: Awaited<ReturnType<typeof runR
  * biggest; ranking against the metrics that actually fail optimises the page.
  */
 function renderDiagnosis(report: AggregatedReport, options: CliOptions): string {
-  const useColor = process.stdout.isTTY === true && !process.env.NO_COLOR;
+  const useColor = colorEnabled();
   const diagnosis = diagnoseReport(report, {
     filters: {
       // `group` is left to the diagnosis layer, which owns the default, so the
@@ -517,117 +701,163 @@ function renderDiagnosis(report: AggregatedReport, options: CliOptions): string 
     },
   });
 
-  const lines: string[] = [];
+  const lines: string[] = ['', ...header(report, useColor), ''];
+  const scoreTarget = report.targets.targets.score;
+  lines.push(
+    `${paint('bold', 'SCORE', useColor)}    ${scorePaint(report.headline.score, useColor)} / 100` +
+      `${scoreTarget === undefined ? '' : paint('dim', `  target ${scoreTarget}`, useColor)}   ` +
+      paint('dim', spreadLine(report.score), useColor),
+  );
   lines.push('');
-  lines.push(`${color(BOLD, report.url, useColor)}  ${color(DIM, `[${report.strategy}]`, useColor)}`);
-  lines.push(
-    `${color(DIM, 'score', useColor)} ${scoreColor(report.headline.score, useColor)}/100  ` +
-      color(DIM, `(${report.stat} of ${report.runsSucceeded}/${report.runsRequested} runs)`, useColor),
-  );
-  lines.push(
-    color(
-      DIM,
-      `p25 ${report.score.p25} · p75 ${report.score.p75} · p95 ${report.score.p95} · ` +
-        `stddev ${report.score.stddev.toFixed(1)}`,
-      useColor,
-    ),
-  );
 
-  lines.push('');
-  lines.push(color(BOLD, 'METRICS OVER BUDGET', useColor));
+  lines.push(paint('bold', 'OVER BUDGET', useColor));
   if (diagnosis.priorityOrder.length === 0) {
-    lines.push(color(GREEN, '  every measured metric is inside its budget', useColor));
+    lines.push(paint('green', `${INDENT}every measured metric is inside its budget`, useColor));
   } else {
-    for (const gap of diagnosis.priorityOrder) {
-      const label = METRIC_LABELS[gap.metric] ?? gap.metric.toUpperCase();
-      const pct = gap.passRate === undefined ? '' : `  pass ${Math.round(gap.passRate * 100)}%`;
-      // Lighthouse reports fractional milliseconds; four decimal places is
-      // measurement noise that only makes two numbers hard to compare by eye.
-      const actual = round(gap.actual, gap.metric === 'cls' ? 3 : 0);
-      const target = round(gap.target, gap.metric === 'cls' ? 3 : 0);
-      const delta = round(gap.delta, gap.metric === 'cls' ? 3 : 0);
-      lines.push(
-        `  ${color(RED, label, useColor)} ${actual} vs ${target} (${delta > 0 ? '+' : ''}${delta})${pct}`,
-      );
-    }
+    const scale = Math.max(
+      ...diagnosis.priorityOrder.map((gap) => Math.max(gap.actual, gap.target)),
+      1,
+    );
+    const entries = diagnosis.priorityOrder.map((gap) => ({
+      key: gap.metric as MetricKey,
+      label: METRIC_LABELS[gap.metric] ?? gap.metric.toUpperCase(),
+      gap,
+    }));
+    lines.push(
+      ...renderTable(BUDGET_COLUMNS, budgetCells(entries, scale, useColor), {
+        width: termWidth() - INDENT.length,
+        gap: GAP,
+        indent: INDENT,
+        styleLabel: (text) => paint('dim', text, useColor),
+      }),
+    );
   }
 
   if (diagnosis.blocked.length > 0) {
     lines.push('');
-    lines.push(color(YELLOW, 'NOT REACHABLE FROM THE FRONTEND', useColor));
-    for (const reason of diagnosis.blocked) lines.push(color(DIM, `  ${reason}`, useColor));
+    lines.push(paint('bold', 'NOT REACHABLE FROM THE FRONTEND', useColor));
+    for (const reason of diagnosis.blocked) {
+      for (const line of wrap(reason, termWidth() - INDENT.length * 2, '    ')) {
+        lines.push(paint('dim', `${INDENT}${line}`, useColor));
+      }
+    }
   }
 
   const lcp = report.lcp;
   if (lcp) {
     lines.push('');
-    lines.push(color(BOLD, 'LCP ELEMENT', useColor));
+    lines.push(paint('bold', 'LCP ELEMENT', useColor));
     lines.push(
-      color(
-        DIM,
-        `  ${lcp.isText ? 'text node' : `${lcp.elementType ?? 'image'} element`}` +
-          `${lcp.text ? ` - "${lcp.text.slice(0, 60)}"` : ''}`,
-        useColor,
-      ),
+      paint('dim', `${INDENT}${lcp.isText ? 'text node' : `${lcp.elementType ?? 'image'} element`}`, useColor),
     );
+    if (lcp.text) {
+      lines.push(paint('dim', `${INDENT}"${truncate(lcp.text, termWidth() - INDENT.length * 2 - 2)}"`, useColor));
+    }
+    // Phases in timeline order, not sorted by size: the point is "how much of
+    // the wait happened before we could even start", and reordering by size
+    // hides the fact that TTFB came first.
     const phaseEntries = Object.entries(lcp.phases).filter(([, v]) => typeof v === 'number') as Array<
       [string, number]
     >;
     if (phaseEntries.length > 0) {
+      const total = phaseEntries.reduce((sum, [, value]) => sum + value, 0);
+      const parts = phaseEntries
+        .map(([key, value]) => `${key.replace(/([A-Z])/g, ' $1').toLowerCase()} ${Math.round(value)}ms`)
+        .join('  ');
+      lines.push(paint('dim', `${INDENT}phases: ${parts}`, useColor));
       lines.push(
-        color(
-          DIM,
-          '  phases: ' +
-            phaseEntries
-              .sort((a, b) => b[1] - a[1])
-              .map(([key, value]) => `${key} ${Math.round(value)}ms`)
-              .join(' · '),
+        paint(
+          'dim',
+          `${INDENT}  of ${Math.round(total)}ms total, the bottleneck is ${lcp.bottleneck}`,
           useColor,
         ),
       );
     }
-    lines.push(color(DIM, `  dominant: ${lcp.bottleneck}`, useColor));
   }
 
   lines.push('');
-  lines.push(color(BOLD, 'WORK QUEUE', useColor));
+  lines.push(paint('bold', 'WORK QUEUE', useColor));
   if (diagnosis.ranked.length === 0) {
-    lines.push(color(DIM, '  nothing actionable against the failing metrics', useColor));
+    lines.push(paint('dim', `${INDENT}nothing actionable against the failing metrics`, useColor));
   } else {
-    for (const entry of diagnosis.ranked) {
-      const saving = entry.insight.savingsMs !== null && entry.insight.savingsMs > 0 ? formatMs(entry.insight.savingsMs) : '-';
-      const share = entry.firstPartyShare === null ? 'unattributed' : `${Math.round(entry.firstPartyShare * 100)}%`;
-      lines.push(
-        `  ${color(DIM, `#${entry.rank}`, useColor)} ${pad(saving, 8)}${pad(entry.insight.id, 40)}${pad(share, 14)}${color(DIM, entry.reason, useColor)}`,
-      );
-      if (entry.sop) {
-        lines.push(color(DIM, `      ${entry.sop.sop}  ${entry.sop.action}`, useColor));
-      }
-      if (entry.thirdPartyOnly) {
-        lines.push(color(YELLOW, '      third-party cost - log as "not actionable in repo"', useColor));
-      }
-    }
+    // Only the scannable facts get columns. The reason and the procedure are
+    // prose, and prose squeezed into a column is prose nobody reads - so they go
+    // on their own lines under the row they belong to.
+    lines.push(
+      ...renderTable(
+        [
+          { key: 'rank', label: '#', align: 'right', min: 2, max: 2 },
+          { key: 'saving', label: 'EST. SAVING', align: 'right', min: 11 },
+          { key: 'id', label: 'INSIGHT', min: 16, grow: true },
+          { key: 'ours', label: 'OURS', align: 'right', min: 5 },
+        ],
+        diagnosis.ranked.map((entry) => [
+          paint('dim', String(entry.rank), useColor),
+          savingsLabel(entry.insight.savingsMs, entry.insight.savingsBytes),
+          entry.insight.flaky
+            ? paint('yellow', `${entry.insight.id} (flaky)`, useColor)
+            : entry.insight.id,
+          entry.firstPartyShare === null
+            ? paint('dim', 'unknown', useColor)
+            : paint(
+                entry.firstPartyShare < 1 ? 'yellow' : 'green',
+                `${Math.round(entry.firstPartyShare * 100)}%`,
+                useColor,
+              ),
+        ]),
+        {
+          width: termWidth() - INDENT.length,
+          gap: GAP,
+          indent: INDENT,
+          styleLabel: (text) => paint('dim', text, useColor),
+          detail: (_row, index) => {
+            const entry = diagnosis.ranked[index];
+            if (!entry) return [];
+            // `reason` already states the third-party verdict, so it is not
+            // repeated as a separate line here.
+            const detail = wrap(entry.reason, termWidth() - INDENT.length - 2, '    ');
+            const lines = detail.map((line) => paint('dim', line, useColor));
+            if (entry.sop) {
+              const sop = wrap(
+                `${entry.sop.sop}  ${entry.sop.action}`,
+                termWidth() - INDENT.length - 2,
+                '      ',
+              );
+              for (const line of sop) lines.push(paintSop(line, useColor));
+            }
+            return lines;
+          },
+        },
+      ),
+    );
   }
 
   if (diagnosis.cautions.length > 0) {
     lines.push('');
-    lines.push(color(BOLD, 'READ THIS BEFORE TRUSTING THE NUMBERS', useColor));
-    for (const caution of diagnosis.cautions) lines.push(color(YELLOW, `  ! ${caution}`, useColor));
+    lines.push(paint('bold', 'BEFORE YOU TRUST THESE NUMBERS', useColor));
+    const body = termWidth() - INDENT.length - 2;
+    for (const caution of diagnosis.cautions) {
+      const wrapped = wrap(caution, body, '  ');
+      lines.push(paint('yellow', `${INDENT}! ${wrapped[0] ?? ''}`, useColor));
+      for (const line of wrapped.slice(1)) {
+        lines.push(paint('yellow', `${INDENT}  ${line}`, useColor));
+      }
+    }
   }
 
   if (diagnosis.exhausted) {
     lines.push('');
     lines.push(
-      color(
-        GREEN,
-        'STOP: no first-party work remains against the failing metrics. Report and escalate.',
+      paint(
+        'green',
+        `${INDENT}STOP: no first-party work remains against the failing metrics. Report and escalate.`,
         useColor,
       ),
     );
   }
 
   lines.push('');
-  lines.push(color(DIM, `reportId ${report.reportId}`, useColor));
+  lines.push(paint('dim', `saved as reportId ${report.reportId}`, useColor));
   lines.push('');
   return lines.join('\n');
 }
@@ -649,7 +879,7 @@ async function loadStoredReport(reportId: string): Promise<AggregatedReport> {
  * derived from, and rewriting it would destroy the ability to re-derive again.
  */
 async function runReanalyze(options: CliOptions): Promise<number> {
-  const useColor = process.stdout.isTTY === true && !process.env.NO_COLOR;
+  const useColor = colorEnabled();
   const targets = loadTargets();
 
   const reportIds = options.reportId
@@ -717,48 +947,68 @@ async function runReanalyze(options: CliOptions): Promise<number> {
   const changed = rows.filter((row) => row.delta?.changed).length;
   const totalRecovered = rows.reduce((sum, row) => sum + (row.delta?.recovered.length ?? 0), 0);
   const totalPhantoms = rows.reduce((sum, row) => sum + (row.delta?.phantomZeroes.length ?? 0), 0);
+  const savedCount = rows.filter((row) => row.saved).length;
+
   lines.push(
-    `${color(BOLD, 'RE-ANALYZED', useColor)} ${rows.length} stored report(s), ` +
-      `${changed} with a changed conclusion, ${totalRecovered} cost figure(s) recovered, ` +
-      `${totalPhantoms} phantom zero(es) corrected`,
+    `${paint('bold', 'RE-ANALYZED', useColor)} ${rows.length} stored report(s)   ` +
+      paint('dim', `${changed} changed · ${totalRecovered} cost figure(s) recovered · ${totalPhantoms} phantom zero(es) corrected`, useColor),
   );
-  for (const row of rows) {
+
+  // Only reports that actually changed are worth a row. Listing all 27 identical
+  // "same" lines buries the two that moved, which is the only reason to run this.
+  const interesting = rows.filter((row) => row.delta?.changed || row.error);
+  if (interesting.length === 0) {
+    lines.push(paint('dim', `${INDENT}no stored report changed its conclusion`, useColor));
+  }
+  for (const row of interesting) {
+    lines.push('');
     if (row.error) {
-      lines.push(`  ${color(RED, row.reportId, useColor)}  ${color(YELLOW, row.error, useColor)}`);
+      lines.push(`${paint('bold', row.reportId, useColor)}  ${paint('red', row.error, useColor)}`);
       continue;
     }
-    const delta = row.delta;
-    if (!delta) continue;
-    const mark = delta.changed ? color(YELLOW, 'changed', useColor) : color(DIM, 'same', useColor);
-    lines.push(`  ${pad(row.reportId, 34)}${mark}${row.saved ? '' : color(DIM, ' (not saved)', useColor)}`);
+    const delta = row.delta!;
+    lines.push(
+      `${paint('bold', row.reportId, useColor)}${row.saved ? '' : paint('dim', '  (not saved)', useColor)}`,
+    );
     for (const change of delta.recovered) {
-      const ms = change.afterMs !== null ? `${change.afterMs}ms` : '-';
       const bytes =
-        change.afterBytes !== change.beforeBytes
-          ? `, ${change.afterBytes ?? '-'} bytes`
-          : '';
+        change.afterBytes !== change.beforeBytes ? ` / ${formatBytes(change.afterBytes)}` : '';
+      // `none` is a real answer, not a missing one: the figure exists but the
+      // field that produced it does not survive into a stored run. Saying
+      // "found in none" would read as a bug in the reader's terminal.
+      const where =
+        change.source === 'none' || change.source === undefined
+          ? 'provenance not recoverable from the stored run'
+          : `found in ${change.source}`;
       lines.push(
-        color(
-          GREEN,
-          `      ${change.insightId}: was 0, actually ${ms}${bytes} (from ${change.source})`,
-          useColor,
-        ),
+        `  ${paint('green', 'recovered', useColor)}  ${change.insightId} ` +
+          paint(
+            'dim',
+            `was recorded as 0, Lighthouse actually measured ${
+              change.afterMs === null ? 'no time saving' : `${change.afterMs}ms`
+            }${bytes} (${where})`,
+            useColor,
+          ),
       );
     }
-    if (delta.phantomZeroes.length > 0) {
+    for (const phantom of delta.phantomZeroes) {
       lines.push(
-        color(DIM, `      ${delta.phantomZeroes.length} finding(s) claimed 0ms where Lighthouse gave no estimate`, useColor),
+        `  ${paint('yellow', 'corrected', useColor)}  ${phantom} ` +
+          paint('dim', 'claimed a 0ms saving that Lighthouse never gave an estimate for', useColor),
       );
     }
     if (delta.failingBefore.join(',') !== delta.failingAfter.join(',')) {
       lines.push(
-        color(
-          DIM,
-          `      failing: [${delta.failingBefore.join(' ')}] -> [${delta.failingAfter.join(' ')}]`,
-          useColor,
-        ),
+        `  ${paint('dim', 'now failing', useColor)}  ${paint('red', delta.failingAfter.join(', ') || 'nothing', useColor)}`,
       );
     }
+  }
+
+  lines.push('');
+  if (savedCount > 0) {
+    lines.push(paint('dim', `${savedCount} report(s) rewritten. Stored runs were left untouched.`, useColor));
+  } else {
+    lines.push(paint('dim', 'Nothing written. Drop --no-save to apply these upgrades.', useColor));
   }
   lines.push('');
   process.stdout.write(`${lines.join('\n')}\n`);
@@ -790,19 +1040,20 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
         save: !options.noSave,
         targets: loadTargets(),
         onRetry: ({ reason, delayMs }) => {
-          if (!options.json) {
-            process.stderr.write(`${color(YELLOW, 'retry', false)}: ${reason} (${delayMs}ms)\n`);
-          }
+          if (options.json) return;
+          process.stderr.write(`${paint('yellow', 'retry', false)}: ${reason} (${delayMs}ms)\n`);
         },
         onRunFinished: ({ run, ok, score, error }) => {
           if (options.json) return;
-          if (ok) {
-            process.stderr.write(
-              `  run ${run}/${options.runs}: score ${Math.round(score as number)}\n`,
-            );
-          } else {
-            process.stderr.write(`  run ${run}/${options.runs}: failed - ${error}\n`);
-          }
+          // Rewritten in place on a tty so ten runs are one line of progress
+          // rather than ten, and a plain appended line everywhere else, where a
+          // carriage return would only corrupt a log file.
+          const label = ok
+            ? `run ${run}/${options.runs}  score ${Math.round(score as number)}`
+            : `run ${run}/${options.runs}  FAILED  ${error}`;
+          const line = `  ${ok ? '' : paint('yellow', label, false)}\n`;
+          process.stderr.write(process.stderr.isTTY ? `\r${line.slice(0, -1)}` : line);
+          if (ok && run === options.runs) process.stderr.write('\n');
         },
       });
       report = result.report;
@@ -810,7 +1061,7 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
     }
 
     for (const warning of warnings) {
-      process.stderr.write(`${color(YELLOW, 'warning', false)}: ${warning}\n`);
+      process.stderr.write(`${paint('yellow', 'warning', false)}: ${warning}\n`);
     }
 
     if (options.json) {

@@ -8,6 +8,7 @@ import type {
   Metrics,
   NormalizedReport,
   RunFailure,
+  SavingsSource,
   SeriesStats,
   Stat,
   StatTriple,
@@ -351,6 +352,22 @@ function accumulateInsights(reports: NormalizedReport[]): Map<string, InsightAcc
  * (typical for informative audits) stays null rather than collapsing to 0, so
  * downstream `maxScore` filters keep behaving the same as on a single run.
  */
+/**
+ * The run that best represents the headline number: the one whose score is
+ * closest to the median, earliest on a tie.
+ *
+ * Anything that describes "what this report actually saw" - the LCP element, the
+ * measurement environment - has to come from this same run, or it risks
+ * describing a run the reader is not looking at.
+ */
+function medianRunOf(reports: NormalizedReport[], medianScore: number): NormalizedReport | undefined {
+  return [...reports].sort(
+    (a, b) =>
+      Math.abs(a.score - medianScore) - Math.abs(b.score - medianScore) ||
+      a.fetchTime.localeCompare(b.fetchTime),
+  )[0];
+}
+
 function aggregateInsights(
   reports: NormalizedReport[],
   medianScore: number,
@@ -361,11 +378,7 @@ function aggregateInsights(
 
   const byId = accumulateInsights(reports);
 
-  const medianRun = [...reports].sort(
-    (a, b) =>
-      Math.abs(a.score - medianScore) - Math.abs(b.score - medianScore) ||
-      a.fetchTime.localeCompare(b.fetchTime),
-  )[0];
+  const medianRun = medianRunOf(reports, medianScore);
   const medianRunById = new Map((medianRun?.insights ?? []).map((i) => [i.id, i]));
 
   const results: AggregatedInsight[] = [];
@@ -395,13 +408,18 @@ function aggregateInsights(
     const scoreStats = statTriple(acc.scoreValues, 'auditScore');
     const savingsMsStats = statTriple(acc.savingsMsValues, 'savingsMs');
     const savingsBytesStats = statTriple(acc.savingsBytesValues, 'savingsBytes');
+    const aggregateMs = acc.savingsMsValues.length > 0 ? savingsMsStats[stat] : null;
+    const aggregateBytes = acc.savingsBytesValues.length > 0 ? savingsBytesStats[stat] : null;
 
     results.push({
       ...base,
       id,
       score: acc.scoreValues.length > 0 ? scoreStats[stat] : null,
-      savingsMs: acc.savingsMsValues.length > 0 ? savingsMsStats[stat] : null,
-      savingsBytes: acc.savingsBytesValues.length > 0 ? savingsBytesStats[stat] : null,
+      savingsMs: aggregateMs,
+      savingsBytes: aggregateBytes,
+      // Always defined, so the label is a statement about the estimate rather
+      // than a field that happens to be missing on older rows.
+      savingsSource: provenanceFor(fromMedian?.savingsSource ?? base.savingsSource),
       appearedInRuns: acc.appearances,
       runsSucceeded,
       flaky: acc.appearances / runsSucceeded < FLAKY_THRESHOLD,
@@ -414,6 +432,21 @@ function aggregateInsights(
   }
 
   return results;
+}
+
+/**
+ * The savings label for an aggregated insight.
+ *
+ * `savingsSource` answers "which Lighthouse field produced this estimate", and
+ * that is a property of the *finding*, not of one run's number: a finding whose
+ * cost Lighthouse priced by summing per-item `wastedMs` was priced that way in
+ * every run. So the representative run's label carries over, and the only thing
+ * to guarantee is that the field is never absent - a missing label reads as a
+ * figure nobody can account for, which is a different and worse claim than
+ * "this estimate's origin is not recoverable".
+ */
+function provenanceFor(recorded: SavingsSource | undefined): SavingsSource {
+  return recorded ?? 'none';
 }
 
 export interface AggregateOptions {
@@ -468,6 +501,11 @@ export function aggregateReports(
     runsSucceeded: reports.length,
     generatedAt: new Date().toISOString(),
     lighthouseVersion: first?.lighthouseVersion ?? 'unknown',
+    // The median run, for the same reason `items` come from it: the headline
+    // describes that run, so the conditions behind it are that run's.
+    environment: medianRunOf(reports, score.median)?.environment ?? {
+      lighthouseVersion: first?.lighthouseVersion ?? 'unknown',
+    },
     headline: { score: pickStat(score, stat), metrics: headlineMetrics },
     score,
     metrics,

@@ -1,8 +1,9 @@
 import { describe, expect, it } from 'vitest';
 import { refreshInsightSavings } from '../src/insights.js';
+import { aggregateReports } from '../src/aggregate.js';
 import { diffReanalyzed, reanalyze, refreshRun } from '../src/reanalyze.js';
 import type { AggregatedReport, Insight, NormalizedReport } from '../src/types.js';
-import { normalizeLh13 } from './helpers.js';
+import { makeReport, normalizeLh13 } from './helpers.js';
 
 const TARGETS = {
   mobile: { score: 90, lcp: 2500, tbt: 200, cls: 0.1, fcp: 1800, speedIndex: 3400 },
@@ -28,8 +29,13 @@ function storedInsight(extra: Partial<Insight> = {}): Insight {
   };
 }
 
-describe('refreshInsightSavings', () => {
-  it('recovers a figure the old normalize-time logic reported as zero', () => {
+/** A stored run carrying one insight, standing in for a retained `runs.json` row. */
+function storedRun(options: { score: number; insight: Insight }): NormalizedReport {
+  const base = makeReport({ score: options.score });
+  return { ...base, insights: [options.insight] };
+}
+
+describe('refreshInsightSavings', () => {  it('recovers a figure the old normalize-time logic reported as zero', () => {
     const refreshed = refreshInsightSavings(storedInsight());
     expect(refreshed.savingsMs).toBe(601);
     expect(refreshed.savingsSource).toBe('items');
@@ -76,8 +82,56 @@ describe('refreshInsightSavings', () => {
   });
 
   it('returns the same object when there is nothing to fill', () => {
-    const before = storedInsight({ savingsMs: 601, savingsBytes: 46_725 });
+    const before = storedInsight({ savingsMs: 601, savingsBytes: 46_725, savingsSource: 'items' });
     expect(refreshInsightSavings(before)).toBe(before);
+  });
+
+  it('backfills a missing provenance label without changing the figure', () => {
+    // Runs saved before `savingsSource` existed carry a real number and no
+    // record of where it came from. The label is recoverable from the retained
+    // rows; the number must be left exactly as stored.
+    const before = storedInsight({ savingsMs: 601, savingsBytes: 46_725 });
+    const after = refreshInsightSavings(before);
+    expect(after.savingsMs).toBe(601);
+    expect(after.savingsBytes).toBe(46_725);
+    expect(after.savingsSource).toBe('items');
+  });
+
+  it('records "none" when nothing about the figure survives to explain it', () => {
+    // A figure recovered from `overallSavingsMs` or `metricSavings` cannot be
+    // re-derived from a stored run, and neither can its source. "None" is the
+    // honest answer; a guessed source would be worse than an admitted absence.
+    const before = storedInsight({ savingsMs: 150, savingsBytes: 33_465, items: [] });
+    const after = refreshInsightSavings(before);
+    expect(after.savingsMs).toBe(150);
+    expect(after.savingsSource).toBe('none');
+  });
+
+  it('labels a finding by how Lighthouse priced it, not by one run', () => {
+    // `savingsSource` is a property of the finding, not of a single
+    // measurement, so an average across runs keeps the label.
+    const runs = [
+      storedRun({ score: 90, insight: storedInsight({ savingsMs: 100, savingsBytes: 1_000, savingsSource: 'items' }) }),
+      storedRun({ score: 91, insight: storedInsight({ savingsMs: 200, savingsBytes: 2_000, savingsSource: 'items' }) }),
+    ];
+    const byMean = aggregateReports(runs, { stat: 'mean' });
+    const mean = byMean.insights.find((i) => i.id === 'render-blocking-insight')!;
+    expect(mean.savingsMs).toBe(150);
+    expect(mean.savingsSource).toBe('items');
+  });
+
+  it('always defines a provenance label, even when no run recorded one', () => {
+    // The reported bug was an aggregated figure rendering as "found in none"
+    // with the field simply absent. These stored rows predate `savingsSource`;
+    // re-analysis backfills it, and the aggregate never leaves it undefined.
+    const runs = [
+      storedRun({ score: 90, insight: storedInsight({ savingsMs: 100, savingsBytes: 1_000 }) }),
+      storedRun({ score: 91, insight: storedInsight({ savingsMs: 200, savingsBytes: 2_000 }) }),
+    ];
+    const report = aggregateReports(runs.map(refreshRun), { stat: 'median' });
+    const insight = report.insights.find((i) => i.id === 'render-blocking-insight')!;
+    expect(insight.savingsSource).toBe('items');
+    expect(report.insights.every((i) => i.savingsSource !== undefined)).toBe(true);
   });
 
   it('does not touch fields it does not own', () => {

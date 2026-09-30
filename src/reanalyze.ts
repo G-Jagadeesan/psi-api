@@ -42,6 +42,12 @@ export interface ReanalyzeOptions {
 export function refreshRun(run: NormalizedReport): NormalizedReport {
   return {
     ...run,
+    // Reports stored before the run environment was recorded have no `environment`
+    // at all. Backfill the one field that was always known, so the rebuilt report
+    // carries an honest partial record rather than an absent one - and never a
+    // fabricated device or CPU, which is the sort of thing that later gets cited
+    // as though the run had stated it.
+    environment: run.environment ?? { lighthouseVersion: run.lighthouseVersion },
     insights: run.insights.map(refreshInsightSavings),
   };
 }

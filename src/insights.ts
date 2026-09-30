@@ -9,6 +9,7 @@ import type {
   MetricKey,
   Metrics,
   NormalizedReport,
+  RunEnvironment,
   SavingsSource,
   SortOrder,
   Strategy,
@@ -60,7 +61,23 @@ export function refreshInsightSavings(insight: Insight): Insight {
   const known = (value: number | null | undefined): boolean =>
     typeof value === 'number' && value > 0;
 
-  if (known(insight.savingsMs) && known(insight.savingsBytes)) return insight;
+  if (known(insight.savingsMs) && known(insight.savingsBytes)) {
+    if (insight.savingsSource !== undefined) return insight;
+    // A stored figure with no recorded provenance: runs saved before
+    // `savingsSource` existed land here. Recover the label without touching the
+    // number. When the figure came from `overallSavingsMs` or `metricSavings`
+    // the re-derivation finds nothing and records `none`, which is the honest
+    // answer - "there was an estimate and we cannot say where it came from" is
+    // better than a source that is guessed or missing.
+    return {
+      ...insight,
+      savingsSource: savingsFromDetails(
+        {} as RawAudit,
+        { items: insight.items ?? [] },
+        insight.displayValue,
+      ).savingsSource,
+    };
+  }
 
   const recomputed = savingsFromDetails(
     // The stored form has no `metricSavings`, so only the row and text sources
@@ -134,6 +151,8 @@ type RawPsiResponse = {
     finalUrl?: unknown;
     fetchTime?: unknown;
     lighthouseVersion?: unknown;
+    configSettings?: Record<string, unknown>;
+    environment?: Record<string, unknown>;
     categories?: Record<string, unknown>;
     audits?: Record<string, RawAudit>;
   };
@@ -801,12 +820,57 @@ export function normalizeReport(
     strategy,
     fetchTime: asString(result.fetchTime, new Date().toISOString()),
     lighthouseVersion: asString(result.lighthouseVersion, 'unknown'),
+    environment: extractEnvironment(result),
     // Lighthouse scores are 0-1; 0.58 * 100 is 57.99999999999999 in binary
     // floating point, so round away the representation error.
     score: Math.round(((asNumber(performance.score) ?? 0) * 100 + Number.EPSILON) * 10) / 10,
     metrics: extractMetrics(audits),
     insights,
     fieldData: extractFieldData(body),
+  };
+}
+
+/* ----------------------------- measurement environment ---------------------------- */
+
+/**
+ * Read back the conditions a run was measured under.
+ *
+ * The request this tool makes is only `url`, `strategy` and `category` - there is
+ * no way to ask PSI for a different device, throttle or CPU, because those are
+ * its server-side defaults. So the only way to know what a stored number
+ * actually means is to record what the response said about it.
+ *
+ * Every field is read from the response verbatim. `throttlingMethod` and
+ * `throttling` are deliberately **not** reconstructed: PSI does not echo them, so
+ * inferring them from `formFactor` would be a guess presented as a measurement.
+ * A caller who needs to know the throttle model has to read the Lighthouse
+ * result itself; what this gives them instead is the `benchmarkIndex`, which is
+ * the part that actually varies between audits and the part that decides whether
+ * two reports are comparable.
+ */
+function extractEnvironment(result: NonNullable<RawPsiResponse['lighthouseResult']>): RunEnvironment {
+  const settings = result.configSettings ?? {};
+  const env = result.environment ?? {};
+  const categories = Array.isArray(settings.onlyCategories)
+    ? settings.onlyCategories.filter((entry): entry is string => typeof entry === 'string')
+    : undefined;
+
+  return {
+    lighthouseVersion: asString(result.lighthouseVersion, 'unknown'),
+    ...(asString(settings.formFactor) ? { formFactor: asString(settings.formFactor) } : {}),
+    ...(asString(settings.emulatedFormFactor)
+      ? { emulatedFormFactor: asString(settings.emulatedFormFactor) }
+      : {}),
+    ...(asNumber(env.benchmarkIndex) !== undefined
+      ? { benchmarkIndex: asNumber(env.benchmarkIndex) }
+      : {}),
+    ...(asString(env.networkUserAgent)
+      ? { networkUserAgent: asString(env.networkUserAgent) }
+      : {}),
+    ...(asString(env.hostUserAgent) ? { hostUserAgent: asString(env.hostUserAgent) } : {}),
+    ...(asString(settings.channel) ? { channel: asString(settings.channel) } : {}),
+    ...(asString(settings.locale) ? { locale: asString(settings.locale) } : {}),
+    ...(categories && categories.length > 0 ? { categories } : {}),
   };
 }
 
