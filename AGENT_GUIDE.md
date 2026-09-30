@@ -20,7 +20,7 @@ The tool is read-only to you. You use it; you do not modify it.
 | Same rules, repo form | `qwik-guvi/CLAUDE.md` (read it if you prefer the app-repo version) |
 | App rules, condensed | **Step 4 → "App rules a performance fix must not violate"** in this guide |
 | Targets | `psi-api/config/targets.json` |
-| Your log | `psi-api/data/<host>/optimization-log.md` |
+| Your log | `psi-api/data/<host>/optimization-log.md` (create it if absent — see Step 10) |
 | App being optimized | `qwik-guvi/` |
 
 `sop-qwik.md` and `qwik-guvi/CLAUDE.md` carry overlapping content; where they differ, `sop-qwik.md` wins. This guide reproduces the parts of them that change what a Lighthouse-driven agent would otherwise get wrong, so you do not have to hold the whole SOP in your head mid-loop — but it is a subset, not a replacement. Read the SOP.
@@ -33,6 +33,33 @@ Two rules that outrank everything else in this document:
 ---
 
 ## 1. The loop
+
+### Step 0 — Find the report you are working from
+
+Every command that does not spend quota takes `--reportId <id>`. A baseline you measured in an earlier session has an ID you no longer have in front of you, and the directories are the only index — there is no CLI flag or endpoint that lists reports.
+
+```bash
+cd psi-api
+# newest first; report ids are <ISO timestamp>-<strategy>, so they sort chronologically
+ls -1t data/<host>/                       # e.g. data/qwik-guvi-perf-fix.codingpuppet.com/
+ls -1 data/www.guvi.in/ | tail            # oldest
+```
+
+Each entry is a directory holding `report.json` and `runs.json`. To see what one actually is before spending a command on it, read its header fields directly — free, and no PSI call:
+
+```bash
+jq -r '"\(.reportId)  \(.url)  score \(.headline.score)  lcp \(.headline.metrics.lcp)"' \
+  data/<host>/<reportId>/report.json
+
+# without jq
+node -e 'const r=require(process.argv[1]);
+  console.log(r.reportId, r.url, "score", r.headline.score, "lcp", r.headline.metrics.lcp)' \
+  ./data/<host>/<reportId>/report.json
+```
+
+`--reportId` searches every host directory, so you do not need to know which host a report was filed under — but you do need the ID.
+
+**Baseline hygiene:** pick the baseline with the *same* `environment` line (`lighthouseVersion`, `benchmarkIndex`, `networkUserAgent`). A report from before a PSI infrastructure change is not a valid comparison, and `benchmarkIndex` is the single best predictor — a number that moved with it did not improve.
 
 ### Step 1 — Baseline
 
@@ -79,7 +106,7 @@ npm run psi -- --reportId <reportId> --diagnose --party first
 Over HTTP, for the ranked queue on its own:
 
 ```bash
-curl "localhost:3000/report/<reportId>/diagnosis?party=first"
+curl "localhost:3939/report/<reportId>/diagnosis?party=first"
 ```
 
 For the plain filtered table, when you need it:
@@ -552,7 +579,7 @@ Use the **baseline's `stddev`** as the noise band — it is the same measurement
 
 **But judge the change on the metric's own spread, not the score's.** The score is a composite: it moves when any input moves, so `score.stddev` is a band built from every metric at once. A report on this project's deployed page had an LCP `stddev` of `0.0` (2401 ms in all 10 runs) next to a score `stddev` of 3.37. Using the score's spread as the band for an LCP change demands a margin the LCP cannot ever produce, and a genuine 500 ms LCP win gets filed as "inconclusive".
 
-Every metric now reports `p25`, `p75` and `p95` alongside its `stddev`, and `distributions.<metric>` reports whether the samples are bimodal. Judge the change you made against **the distribution of the metric you changed**:
+Every metric reports `p25`, `p75`, `p95`, `stddev` and its raw `values`, and `distributions.<metric>` reports whether that metric's samples are bimodal. Judge the change you made against **the distribution of the metric you changed**:
 
 | Change to | Judge on |
 | --- | --- |
@@ -560,13 +587,34 @@ Every metric now reports `p25`, `p75` and `p95` alongside its `stddev`, and `dis
 | TBT | `metrics.tbt.p75` and `passRate`, not the score |
 | CSS/JS weight | `distributions.score` and the score's `p75` |
 
-**A bimodal metric is not one population, so its `stddev` is not a noise band.** If `distributions.score.bimodal` is `true`, the page has two distinct states — on this project's page the scores cluster at 87.5–88.5 and 93–95.5. Averaging those gives a spread that describes neither state. Read the two lanes separately, work out which lane the change moved, and only compare within a lane. `--diagnose` prints this as a caution.
+> **These numbers are only in `--json`.** The human-readable view prints a spread line for the **score** only; the metric table shows median, target, verdict, % of target, bar and runs-in-target, and nothing else. `metrics.<metric>.p75`, `metrics.<metric>.stddev` and `distributions.<metric>` do not appear anywhere in the text output. To judge a change on the metric you actually edited, read them from JSON:
+>
+> ```bash
+> npm run --silent psi -- --reportId <id> --json \
+>   | jq '{lcp: (.metrics.lcp | {median, p75, p95, stddev}),
+>        bimodalLcp: .distributions.lcp.bimodal}'
+> ```
+>
+> No `jq`? See 5.7.1 for the equivalent `node -e` one-liner.
+>
+> `--diagnose` does print a bimodality *caution* when the score splits, but it prints no percentiles, and it cautions on the *score's* split rather than the metric's. Do not conclude a metric is stable because the text view is quiet about it.
+
+**A bimodal metric is not one population, so its `stddev` is not a noise band.** If `distributions.<metric>.bimodal` is `true`, the page has two distinct states — on this project's page the scores cluster at 87.5–88.5 and 93–95.5. Averaging those gives a spread that describes neither state. Read the two lanes separately, work out which lane the change moved, and only compare within a lane. `--diagnose` prints the score's split as a caution; every other metric's split is JSON-only.
 
 Also check the target metric you were actually fixing, not just the score. A change that trades LCP for CLS may leave the score flat while making things worse for users. And re-check `passRate`: a change that pulls one over-budget run back inside the budget is worth keeping even when the median does not move.
 
 ### Step 10 — Log it
 
-Append to `psi-api/data/<host>/optimization-log.md`. **Append-only — never edit or delete earlier entries.**
+Append to `psi-api/data/<host>/optimization-log.md`, where `<host>` is the measured URL's hostname. **Append-only — never edit or delete earlier entries.**
+
+The file does not ship with the tool — create it on your first iteration if it is absent:
+
+```bash
+cd psi-api
+touch "data/<host>/optimization-log.md"    # the host dir already exists if you have run a report
+```
+
+One log per host, shared across every page on that host, so keep each entry headed with the page it concerns.
 
 ```markdown
 ## Iteration 3 - 2026-09-29T11:20:00Z
@@ -768,6 +816,24 @@ curl "http://127.0.0.1:3939/report/2026-09-29T05-45-30Z-mobile/insights?group=op
 
 `savingsSource` says where the figure came from: `overall` (Lighthouse's own rollup), `metricSavings` (its per-metric time impact), `items` (the per-row sum), or `displayValue` (parsed out of the human-readable string). `firstPartyShare` is `0`–`1`, or `null` when the cost could not be attributed to a host at all.
 
+#### `fieldData` — the only field data in the report
+
+Every report carries `fieldData`, passed through from PSI untouched:
+
+```json
+"fieldData": {
+  "loadingExperience": { "initial_url": "https://example.com/", "metrics": { … }, "percentiles": { … } },
+  "originLoadingExperience": { … }
+}
+```
+
+**This is CrUX — real user measurements, not a lab run.** Everything else in a report is a Lighthouse lab measurement on one emulated device; this is what actual visitors experienced. It is the only place the tool can tell you whether the lab number reflects reality, and it is worth reading before you accept a change: a page whose CrUX `percentiles.lcp.p75` is already good while the lab LCP is poor means the lab is measuring a case real users do not hit.
+
+- `loadingExperience` is keyed on the exact measured URL; `originLoadingExperience` covers the whole origin.
+- **`{}` or `null` means insufficient traffic, not a bug.** CrUX only reports an origin once it has enough real sessions. A staging host will essentially always be empty — so on staging, judge on the lab numbers and say so in your report rather than treating the absence as a finding.
+- It is stripped of the cache-busting nonce along with everything else, so `initial_url` never carries `?psi_nonce=`.
+- It appears in `--json` and over HTTP. It is **not** rendered in the text output at all, and it is not part of `--diagnose`.
+
 ### 5.3 `GET /report/:reportId/diagnosis` — the ranked work queue
 
 ```bash
@@ -855,25 +921,35 @@ npm run psi -- https://www.guvi.co/ --runs 10 --stat median --strategy mobile
 ```
 
 ```
-https://www.guvi.co/  [mobile]
-score 27/100  (median of 10/10 runs)
-LCP 16070ms!  TBT 2127ms!  CLS 0.000   FCP 7332ms!  SI 13287ms!
-spread: score p25 25 p75 29 p95 33.55 · stddev 2.9
-BELOW TARGET  score -63 (0% of runs in budget) lcp +13570 (0% of runs in budget) tbt +1927 (0% of runs in budget) fcp +5532 (0% of runs in budget) speedIndex +9887 (0% of runs in budget)
+https://www.guvi.co/
+mobile · Lighthouse 13.5.0 · median of 10/10 runs · 2026-09-30
+measured under moto g power (2022) · CPU index 843 (higher = slower) · en-US · performance only
 
-INSIGHTS (6 of 32)
-  SAVING   ID                        GROUP          METRIC     ITEMS
-  6550ms   cache-insight             diagnostic   lcp,fcp  99
-  1960ms   unused-javascript         opportunity  lcp,fcp  22
-  1200ms   image-delivery-insight    diagnostic   lcp,fcp  5
-  750ms    render-blocking-insight   diagnostic   lcp,fcp  1
-  150ms    unused-css-rules          opportunity  lcp,fcp  3
-  -        lcp-discovery-insight     diagnostic   lcp      2
+SCORE    95 / 100  target 90   p25 95 · p75 95 · p95 95 · range 94–95 · stddev 0.4
 
-reportId 2026-09-29T05-45-30Z-mobile
+VERDICT  PASS  2 of 6 targets failing
+        FCP 1991ms vs 1800ms (0/10 runs in target), SI 3427ms vs 3400ms (4/10 runs in target)
+
+  METRIC       MEDIAN  TARGET  VERDICT      % OF TARGET                    RUNS IN TARGET
+  FCP          1991ms  1800ms  +191ms over         111%  ████████×·······            0/10
+  LCP          2476ms  2500ms  in target            99%  ████████┃·······            9/10
+  Speed index  3427ms  3400ms  +27ms over          101%  ████████×·······            4/10
+  TBT             8ms   200ms  in target             4%  ········┃·······           10/10
+  CLS           0.000   0.100  in target             0%  ········┃·······           10/10
+
+FINDINGS  32 shown
+  EST. SAVING  INSIGHT                          AFFECTS  OURS   SEEN
+        559ms  render-blocking-insight          LCP FCP  100%  10/10
+        225ms  image-delivery-insight           LCP FCP     —  10/10
+        150ms  cache-insight                    LCP FCP    0%  10/10
+            —  bootup-time                      TBT      100%  10/10
+         84KB  unused-javascript                LCP FCP  100%  10/10
+  ...
+
+saved as reportId 2026-09-30T08-04-23Z-mobile
 ```
 
-The pass rate appears next to every failing gap, and the spread line reports the tail percentiles rather than just `stddev`. Add `--diagnose` for the ranked queue, the LCP element, and the cautions.
+The spread line reports the score's tail percentiles, and every failing gap carries its run count. **Note what is *not* here:** per-metric `p75`/`stddev`, per-metric bimodality, `fieldData`, and the insight rows. Add `--diagnose` for the ranked queue, LCP element, image checks and cautions; `--items` / `--requests` for the rows; `--json` for everything else (see 5.7.1).
 
 ```bash
 # costs nothing - same stored report, TBT focus, flaky hidden, JSON out
@@ -888,7 +964,110 @@ Useful flags: `--strategy desktop`, `--stat mean`, `--limit N`, `--search "third
 `--id lcp-discovery-insight,image-delivery-insight`, `--no-save`, `--reanalyze`, `--help`.
 Exit code is `0` on success and `1` on error.
 
-### 5.8 GitHub — find the staging PR and poll it
+#### 5.7.1 `--json` — everything the text view leaves out
+
+`--json` is not "the same report, machine-readable". It is a **superset**, and several things you need exist *only* here. This is the single most under-used surface in the tool.
+
+```bash
+npm run --silent psi -- --reportId <id> --json
+```
+
+The payload is the whole `AggregatedReport`, plus four extra keys the report file does not have:
+
+| Extra key | What it is |
+| --- | --- |
+| `images` | The full image-check list. The text view caps IMAGE CHECKS at 15 rows; this has every finding. |
+| `matchedInsights` | The insights **after** your filters. `insights` alongside it is always the complete unfiltered set — use `matchedInsights` when you passed filters. |
+| `diagnosis` | Present **only** when you also pass `--diagnose`. Same object `GET /report/:reportId/diagnosis` returns. |
+| `warnings` | Array of strings. Empty is good; the PSI-cache warning lands here. |
+
+And inside the report itself, these are JSON-only:
+
+| Field | Why you want it |
+| --- | --- |
+| `metrics.<metric>.p75` / `p95` / `stddev` / `values` | **The metric's own spread.** Step 9 tells you to judge on these; the text view prints a spread line for the score only. |
+| `distributions.<metric>` | Bimodality per metric, with `lanes`, `share`, `separation` and `note`. `--diagnose` cautions on the *score's* split only. |
+| `stats.mean` / `stats.median` / `stats.mode` | Every metric recomputed under each statistic, side by side. |
+| `fieldData` | CrUX real-user data — the only field-vs-lab signal. See 5.2. |
+| `requests[]` | Every request with `resourceSize`, `statusCode`, `priority`, `entity`, `mimeType`. `--requests` prints a subset. |
+| `insights[].title` / `description` | Lighthouse's own explanation of each audit. `--items` prints rows, not prose. |
+| `insights[].displayValue` | The raw human string savings were parsed from — how you audit a suspicious estimate. |
+| `insights[].itemHosts` | The distinct hosts behind the rows. This is what tells you "not actionable in repo". |
+| `insights[].firstPartyItems` / `thirdPartyItems` | The counts behind `firstPartyShare`. |
+| `insights[].stats` | mean/median/mode of *that insight's* score and savings — shows whether a saving is consistent across runs. |
+| `environment` | The full record including `benchmarkIndex`, `hostUserAgent`, `channel`, `categories`. |
+
+A worked read — is the metric I changed actually bimodal, and how tight is it? With `jq`:
+
+```bash
+npm run --silent psi -- --reportId <id> --json | jq '{
+  lcp:  (.metrics.lcp | {median, p75, stddev}),
+  fcp:  (.metrics.fcp | {median, p75, stddev}),
+  bimodalLcp: .distributions.lcp.bimodal,
+  field: .fieldData,
+  warnings
+}'
+```
+
+`jq` is not always installed. The same read in `node`, which the tool already depends on:
+
+```bash
+npm run --silent psi -- --reportId <id> --json > report.tmp.json
+node -e '
+const r = require("./report.tmp.json");
+const spread = (k) => ({ median: r.metrics[k].median, p75: r.metrics[k].p75, stddev: r.metrics[k].stddev });
+console.log(JSON.stringify({
+  lcp: spread("lcp"), fcp: spread("fcp"),
+  bimodalLcp: r.distributions.lcp.bimodal,
+  field: r.fieldData, warnings: r.warnings
+}, null, 2));'
+rm report.tmp.json
+```
+
+> Two traps this avoids. **Redirect to a file rather than piping** — if the reader exits early the CLI dies with an unhandled `EPIPE` and prints a stack trace. And **write the file into the current directory**: `require("/tmp/…")` works on a POSIX shell but fails on Windows, where Node resolves `/tmp` literally.
+
+**`--items` and `--json` compose differently, and it surprises people.** With `--items` the named ids are printed as rows; with `--json` the same flag is silently converted into an `id` filter (`src/cli.ts`), so you get the matching insights — rows included — under `matchedInsights`. `--requests` is ignored under `--json`, because `requests` is already in the payload.
+
+### 5.8 `runs.json` — per-run detail nothing else exposes
+
+Every free command above reads `report.json`, which is an **aggregate**. The individual runs live beside it:
+
+```
+data/<host>/<reportId>/
+  report.json   # the aggregate - what every CLI flag and endpoint returns
+  runs.json     # array of NormalizedReport, one per successful run
+```
+
+Nothing in the CLI or the HTTP API reads `runs.json` except `--reanalyze`. It is the only place you can see:
+
+| Field | Only available here |
+| --- | --- |
+| `runs[].metrics` | Every metric of that individual run — the raw series behind `p25`/`stddev` |
+| `runs[].environment` | That run's own `benchmarkIndex`, `networkUserAgent`, `lighthouseVersion` |
+| `runs[].requests[]` | That run's own request table. `report.json` keeps only the **median** run's. |
+| `runs[].insights[]` | That run's insights, including ones absent from the median run |
+| `runs[].fetchTime` | When the run happened |
+
+This matters more than it sounds. `report.environment` is taken from the run **closest to the median**, so it is one run's conditions, not the set's. On one real stored report here, `report.environment.benchmarkIndex` read 473.5 while the ten runs behind it ranged from **105.5 to 1292.5** — a twelve-fold spread in the CPU each was scored against. The "measured under" line is honest about what it is, but it is not a summary, and two runs measured under materially different CPU conditions are not two samples of one population. That report's `distributions.lcp.bimodal` is `true` for exactly this reason.
+
+```bash
+# every run's CPU benchmark index, with the score and timestamp  (jq)
+jq -r '.[] | "\(.environment.benchmarkIndex)\t\(.score)\t\(.fetchTime)"' \
+  data/<host>/<reportId>/runs.json
+
+# same thing without jq
+node -e 'require(process.argv[1]).forEach(r =>
+  console.log(r.environment.benchmarkIndex, r.score, r.fetchTime))' \
+  ./data/<host>/<reportId>/runs.json
+
+# per-run LCP series
+node -e 'console.log(require(process.argv[1]).map(r => r.metrics.lcp).join(", "))' \
+  ./data/<host>/<reportId>/runs.json
+```
+
+Reading `runs.json` is free and read-only. Do not edit it — `--reanalyze` rebuilds from it, and it is never rewritten, so a rebuild can always be redone.
+
+### 5.9 GitHub — find the staging PR and poll it
 
 Verified against `guvi-geek/qwik-guvi` on 2026-09-29, branch `perf-fix`:
 
@@ -902,7 +1081,7 @@ $ gh run list --branch perf-fix --limit 3
 
 So on this repo the staging PR number is discoverable, and the poll loop runs, but there is nothing for GitHub Actions to report. The build is CodeBuild via `buildspec.yml`. The agent's fallback is to poll the staging URL's build hash each minute, and to ask a human which pipeline the branch triggers.
 
-### 5.9 Why one push per settled build
+### 5.10 Why one push per settled build
 
 A correct timeline, and the mistake next to it:
 

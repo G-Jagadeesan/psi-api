@@ -221,8 +221,11 @@ curl "http://127.0.0.1:3939/report/$ID/diagnosis?party=first"
 | `blocked` | Budgets the server round trip makes unreachable. |
 | `cautions` | Everything that changes how the numbers should be read. |
 | `exhausted` | `true` when the failing metrics have no first-party work left against them. Stop and escalate. |
+| `images` | The full image-check list. The CLI's IMAGE CHECKS block caps at 15 rows; this is every finding. |
 
-`npm run psi -- --reportId <id> --diagnose` renders the same queue as text, through the same code path.
+The response also carries `reportId`, `url`, `strategy`, `headline`, `targets`, `lcp` and `distributions`.
+
+`npm run psi -- --reportId <id> --diagnose` renders the same queue as text, through the same code path — but the CLI's IMAGE CHECKS block prints at most 15 rows, so read this endpoint (or `--json`) for the full list.
 
 ### `POST /insights`
 
@@ -281,7 +284,7 @@ Runs the same core code as the server, so no server is needed.
 | `--requests [start\|size]` | — | Print every request the median run made. Honours `--party` and `--limit`. |
 | `--limit <n>` | — | |
 | `--noFlaky` | — | Hide insights seen in <30% of runs. |
-| `--json` | off | Machine-readable output. |
+| `--json` | off | Machine-readable output, and a **superset** of the text view — see [What the text view does not show](#what-the-text-view-does-not-show). |
 | `--no-save` | off | Don't write to `data/`. |
 
 ```bash
@@ -347,6 +350,117 @@ If any runs failed, a yellow `N run(s) failed:` block lists up to three of them.
 
 `--diagnose` replaces FINDINGS with the ranked work queue, the LCP element, IMAGE CHECKS, and the cautions described under [`GET /report/:reportId/diagnosis`](#get-reportreportiddiagnosis); the metric table there shows only failing targets. `--items` and `--requests` print the rows of named insights and the median run's request table. Colour is on when stdout is a terminal; `NO_COLOR` turns it off and `FORCE_COLOR=1` forces it on.
 
+### What the text view does not show
+
+The default output is a summary. Several things in the report have **no representation in it at all**, and an agent comparing two measurements will reach for them:
+
+| Only in `--json` / the API | Why it matters |
+| --- | --- |
+| `metrics.<metric>.p75`, `.p95`, `.stddev`, `.values` | **The metric's own spread.** The SCORE line prints a spread for the score alone; the metric table shows median, target, verdict, % of target, bar and runs-in-target. A change to LCP must be judged on `metrics.lcp`, and those numbers are JSON-only. |
+| `distributions.<metric>` | Bimodality per metric. `--diagnose` raises a caution for the *score's* split only; `fcp`, `lcp`, `tbt`, `cls`, `speedIndex`, `tti` and `ttfb` are JSON-only. |
+| `stats.mean` / `.median` / `.mode` | Every metric recomputed under each statistic, side by side. |
+| `fieldData` | CrUX real-user data. See [field data](#field-data-crux) below. |
+| `requests[]` in full | `--requests` prints a subset; the array carries `resourceSize`, `statusCode`, `priority`, `entity`, `mimeType`. |
+| `insights[].title`, `.description` | Lighthouse's own prose for each audit. |
+| `insights[].displayValue` | The raw human string savings were parsed out of — how you audit a suspicious estimate. |
+| `insights[].itemHosts`, `.firstPartyItems`, `.thirdPartyItems` | The ownership evidence behind `firstPartyShare`, and what tells you "not actionable in repo". |
+| `insights[].stats` | mean/median/mode of that insight's own score and savings, so you can see whether a saving is consistent across runs. |
+| `insights[].items`, `.itemsTotal` | `--items` renders rows; `--json` gives them raw. |
+| `environment` in full | Including `benchmarkIndex`, `hostUserAgent`, `channel`, `categories`. |
+| `images.findings` | IMAGE CHECKS caps at 15 rows; this has every finding. |
+
+`--json` also adds four keys the stored report does not have:
+
+| Key | |
+| --- | --- |
+| `images` | The full image-check list, computed on demand. |
+| `matchedInsights` | The insights **after** your filters. `insights` stays the complete unfiltered set, so read `matchedInsights` whenever you passed filters. |
+| `diagnosis` | Present only alongside `--diagnose`. Same object [`GET /report/:reportId/diagnosis`](#get-reportreportiddiagnosis) returns. |
+| `warnings` | Array of strings, including the [PSI cache](#psi-caches-per-url) warning. |
+
+Two composition details worth knowing:
+
+- **`--items` behaves differently under `--json`.** In text it prints the named insights' rows; in JSON the flag is converted into an `id` filter, so the matches — rows included — come back under `matchedInsights`.
+- **`--requests` is a no-op under `--json`,** because `requests` is already in the payload.
+
+```bash
+# judge a change on the metric's own distribution, not the score's
+npm run --silent psi -- --reportId $ID --json | jq '{
+  lcp: (.metrics.lcp | {median, p75, stddev}),
+  bimodal: .distributions.lcp,
+  field: .fieldData
+}'
+```
+
+Without `jq` — and writing to a file rather than piping, because a reader that exits early kills the CLI with an unhandled `EPIPE`:
+
+```bash
+npm run --silent psi -- --reportId $ID --json > report.tmp.json
+node -e '
+const r = require("./report.tmp.json");
+console.log(JSON.stringify({
+  lcp: (({median, p75, stddev}) => ({median, p75, stddev}))(r.metrics.lcp),
+  bimodal: r.distributions.lcp.bimodal,
+  field: r.fieldData
+}, null, 2));'
+rm report.tmp.json
+```
+
+Keep that scratch file in the current directory: `require("/tmp/…")` works under a POSIX shell but fails on Windows, where Node resolves `/tmp` literally.
+
+### Field data (CrUX)
+
+Every report carries `fieldData`, passed through from PSI untouched. It is the only **real-user** data in the tool — everything else is a lab measurement on one emulated device:
+
+```json
+"fieldData": {
+  "loadingExperience": { "initial_url": "https://example.com/", "metrics": { … }, "percentiles": { … } },
+  "originLoadingExperience": { … }
+}
+```
+
+`loadingExperience` is keyed on the exact measured URL, `originLoadingExperience` on the whole origin. **`{}` or `null` means insufficient traffic, not a bug** — CrUX needs a threshold of real sessions, so a staging host is essentially always empty. On staging, judge on the lab numbers and say so rather than reading the absence as a finding. The cache-busting [nonce](#the-cache-busting-param-never-appears-in-output) is stripped here too, so `initial_url` never carries `?psi_nonce=`.
+
+It appears in `--json` and over HTTP, is not rendered in the text output, and is not part of `--diagnose`.
+
+### `runs.json`: per-run detail
+
+Every free command reads `report.json`, which is an **aggregate**. The individual runs sit beside it:
+
+```
+data/<host>/<reportId>/
+  report.json   # the aggregate - what every CLI flag and endpoint returns
+  runs.json     # one NormalizedReport per successful run
+```
+
+Only `--reanalyze` reads `runs.json`. It is the sole place to see `runs[].metrics` (the raw series behind every percentile), `runs[].requests[]` (each run's own request table — `report.json` keeps only the median run's), `runs[].insights[]`, `runs[].fetchTime`, and `runs[].environment`.
+
+That last one is the reason to look. `report.environment` is taken from **the run closest to the median**, so it describes one run, not the set. On one real report stored by this tool, `report.environment.benchmarkIndex` read 473.5 while the ten runs behind it ranged from **105.5 to 1292.5** — a twelve-fold spread in the CPU each was scored against. Two runs under materially different conditions are not two samples of one population.
+
+```bash
+jq -r '.[] | "\(.environment.benchmarkIndex)\t\(.score)\t\(.fetchTime)"' data/<host>/<reportId>/runs.json
+
+# same, without jq
+node -e 'require(process.argv[1]).forEach(r =>
+  console.log(r.environment.benchmarkIndex, r.score, r.fetchTime))' ./data/<host>/<reportId>/runs.json
+```
+
+Reading it is free and read-only. Do not edit it: `--reanalyze` rebuilds from it, and it is never rewritten, so a rebuild can always be redone.
+
+### Finding a stored report
+
+Report ids are `<ISO timestamp>-<strategy>` inside `data/<host>/`, so they sort chronologically. There is no CLI flag or endpoint that lists reports — the directories are the index:
+
+```bash
+ls -1t data/<host>/                                    # newest first
+
+# what a stored report actually is, without spending a command on it
+jq -r '"\(.reportId)  \(.url)  score \(.headline.score)  lcp \(.headline.metrics.lcp)"' \
+  data/<host>/<reportId>/report.json
+```
+
+`--reportId` and `GET /report/:reportId` search every host directory, so you need the id but not the host.
+
 ### `--reanalyze`: rebuilding stored reports for free
 
 A stored `report.json` is a frozen snapshot of whatever the aggregation rules produced on the day it was written, so improving those rules does nothing for the history. `--reanalyze` re-derives each report from its own stored runs, which costs no PSI quota:
@@ -370,7 +484,7 @@ Exit code is `0` on success, `1` on error — so `npm run --silent psi -- <url> 
 
 ## Aggregation
 
-Every metric and the score are reported with all three statistics plus the raw values, so a caller can always see the shape of the distribution:
+Every metric and the score are reported with all three statistics plus the raw values, so a caller can always see the shape of the distribution. **All of this is `--json` / API only** — the text view prints a spread line for the score and nothing per-metric (see [What the text view does not show](#what-the-text-view-does-not-show)):
 
 ```json
 {
@@ -440,6 +554,8 @@ measured under moto g power (2022) · CPU index 928 (higher = slower) · en-US �
 PSI chooses the device, throttle and CPU server-side — the caller cannot request them — so the only way to know what a stored number means is to record what the response said about it. The line captures the device (parsed from the network user agent), the CPU benchmark index, locale and categories.
 
 Two reports are only comparable when measured under the same conditions. A score that moves with the CPU index has not improved.
+
+**This line describes one run, not the set.** `environment` is taken from the run whose score is closest to the median — the run the headline numbers describe — so the conditions of the other nine are not summarised anywhere in `report.json`. On one real report stored by this tool, `report.environment.benchmarkIndex` read 473.5 while the ten runs behind it ranged from **105.5 to 1292.5**. When you need every run's own conditions, read `runs.json` ([details](#runsjson-per-run-detail)).
 
 Throttling is deliberately absent: PSI does not echo it, and inferring "Slow 4G" from the form factor would be a guess printed as a measurement.
 
@@ -578,6 +694,28 @@ Insights are merged across runs by audit id:
 - `stats` — all three statistics for each of those, so you can see whether savings are consistent.
 - `items` — taken from the run whose score was closest to the median, because that is the run the headline number describes. Truncated to the top 25, with `itemsTotal` giving the original length.
 
+The fields on an insight, and where each one is readable. **Everything here is `--json` / API only** except the five the FINDINGS table prints (`savingsMs`, `id`, `metricsAffected`, `firstPartyShare`, `appearedInRuns`):
+
+| Field | | Use it for |
+| --- | --- | --- |
+| `id` | `string` | The audit id. Pass to `--id`, `--items`, `--search`. |
+| `title` | `string` | Lighthouse's short name for the audit. |
+| `description` | `string` | Lighthouse's own prose explaining the audit. Not printed anywhere in the text output. |
+| `displayValue` | `string` | The human string the audit reported, e.g. `"Est savings of 57 KiB"`. How you audit a suspicious estimate — and sometimes the *only* place a figure exists, which is why it is a savings source. |
+| `score` | `number \| null` | The audit's own score, aggregated. `null` when Lighthouse emitted no score (common for modern `-insight` audits). |
+| `scoreDisplayMode` | `string` | Why the score is or is not meaningful: `binary`, `numeric`, `informative`, `notApplicable`, `manual`. |
+| `group` | `InsightGroup` | `opportunity`, `diagnostic`, `passed`, `informative`, `notApplicable`. See [Insight groups](#insight-groups). |
+| `savingsMs` / `savingsBytes` | `number \| null` | The estimate, in whichever unit Lighthouse gave. `null` is "no estimate", not zero. |
+| `savingsSource` | `SavingsSource` | Which field the figure was read from: `overall`, `metricSavings`, `items`, `displayValue`, `none`. |
+| `metricsAffected` | `string[]` | The metrics Lighthouse says the audit bears on. |
+| `items` / `itemsTotal` | `unknown[]` / `number` | The audit's rows, and how many there were before the top-25 trim. `--items` renders these. |
+| `firstPartyItems` / `thirdPartyItems` | `number` | How many rows sit on your hosts vs someone else's. The counts behind `firstPartyShare`. |
+| `itemHosts` | `string[]` | The distinct hosts behind the rows, capped for readability. **This is what tells you a finding is not actionable in your repo.** |
+| `firstPartyShare` | `number \| null` | 0–1, or `null` when unattributable. |
+| `appearedInRuns` / `runsSucceeded` | `number` | How many runs the audit appeared in, out of successful runs. |
+| `flaky` | `boolean` | Fewer than 30% of successful runs. |
+| `stats` | `AggregatedInsightStats` | mean/median/mode of this insight's `score`, `savingsMs` and `savingsBytes` — so you can see whether a saving is consistent or a one-run artifact. |
+
 ### How savings are read
 
 Lighthouse reports estimated savings in several shapes depending on version and audit, so each is read in turn and the **first non-zero** one wins:
@@ -697,7 +835,9 @@ data/
 
 `<reportId>` is `<ISO timestamp>-<strategy>`, which sorts chronologically. `data/` and `.env` are gitignored.
 
-`report.json` is a snapshot of whatever the aggregation rules produced on the day it was written, so improving those rules does nothing for history. `runs.json` keeps the per-run detail — metrics, insights, items, display strings — which is what `--reanalyze` rebuilds from at no quota cost. A rebuild **only fills in** a missing savings figure: one that Lighthouse already supplied is never overwritten, because it may have come from a rollup that does not survive normalization and cannot be reconstructed. `runs.json` is never rewritten, so a rebuild can always be redone.
+`report.json` is a snapshot of whatever the aggregation rules produced on the day it was written, so improving those rules does nothing for history. `runs.json` keeps the per-run detail — metrics, insights, items, display strings — which is what `--reanalyze` rebuilds from at no quota cost, and what nothing else reads (see [`runs.json`: per-run detail](#runsjson-per-run-detail)). A rebuild **only fills in** a missing savings figure: one that Lighthouse already supplied is never overwritten, because it may have come from a rollup that does not survive normalization and cannot be reconstructed. `runs.json` is never rewritten, so a rebuild can always be redone.
+
+A host directory may also hold an `optimization-log.md`, the append-only per-host record an optimizing agent maintains — see [AGENT_GUIDE.md](./AGENT_GUIDE.md) Step 10. The tool never creates or reads it.
 
 The public `guvi-guvi` SOP sets the real bar: **Lighthouse 90+ minimum, 95+ best case, mobile and desktop.** The desktop thresholds above are the tighter interpretation of that; adjust both to match what you actually enforce.
 

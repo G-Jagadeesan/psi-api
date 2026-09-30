@@ -103,6 +103,7 @@ Options:
   --search <text>         Case-insensitive match on audit id or title
   --id <list>             Comma separated audit ids
   --hasItems              Only insights that carry a details item list
+  --noItems               Forbid a details item list (the inverse of --hasItems)
   --party <any|first|third>  Whose cost counts (default any)
                           first = keep everything you own any part of; drops ONLY
                           findings that are entirely somebody else's cost. A mixed
