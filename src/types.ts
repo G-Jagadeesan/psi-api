@@ -199,7 +199,15 @@ export interface Distribution {
    * explains nothing; large means the two lanes are genuinely different worlds.
    */
   separation: number;
-  /** Human-readable reason, present when `bimodal` is true. */
+  /**
+   * Human-readable explanation of the split.
+   *
+   * Gated more tightly than `bimodal`, which is a statistical claim and this is
+   * an actionable one: two lanes are reported as `bimodal: true` long before the
+   * gap between them is wide enough to change what anyone should do. The note
+   * only appears once the lanes are more than 10 apart, so a caller that wants to
+   * *say something* about the distribution must test `note`, not `bimodal`.
+   */
   note?: string;
 }
 

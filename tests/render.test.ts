@@ -9,8 +9,10 @@ import {
   formatBytes,
   metricDelta,
   metricValue,
+  medianOverTarget,
   paint,
   passCount,
+  passSeverity,
   renderTable,
   savingsLabel,
   shortenUrl,
@@ -241,12 +243,12 @@ describe('metricValue', () => {
 });
 
 describe('metricDelta', () => {
-  it('says "in budget" when the median is under, whatever the pass rate says', () => {
-    // A metric can sit inside its budget on the median while too few runs hold
-    // it. Printing "-178ms over" for a metric 178ms *under* budget sends a
+  it('says "in target" when the median is under, whatever the pass rate says', () => {
+    // A metric can sit inside its target on the median while too few runs hold
+    // it. Printing "-178ms over" for a metric 178ms *under* target sends a
     // reader to fix the wrong thing.
-    expect(metricDelta('speedIndex', -178)).toBe('in budget');
-    expect(metricDelta('tbt', -82)).toBe('in budget');
+    expect(metricDelta('speedIndex', -178)).toBe('in target');
+    expect(metricDelta('tbt', -82)).toBe('in target');
   });
 
   it('states the overshoot in the metric own unit', () => {
@@ -285,6 +287,47 @@ describe('passCount', () => {
   it('reports absent rather than a misleading 100%', () => {
     expect(passCount({})).toBe(ABSENT);
     expect(passCount({ passRate: 0.9 })).toBe(ABSENT);
+  });
+});
+
+describe('medianOverTarget', () => {
+  it('ignores the pass-rate verdict entirely', () => {
+    // The reported bug: a metric whose median is comfortably inside target still
+    // fails the pass-rate gate, and colouring the row off the gate put the word
+    // "in target" next to a red label. The row is the median's business.
+    expect(medianOverTarget({ delta: -178 })).toBe(false);
+    expect(medianOverTarget({ delta: -82 })).toBe(false);
+    expect(medianOverTarget({ delta: 354 })).toBe(true);
+  });
+
+  it('treats sitting exactly on the line as in target', () => {
+    // A median equal to the target has not exceeded it, and the bar draws the
+    // marker at the fill's edge, so the two must agree.
+    expect(medianOverTarget({ delta: 0 })).toBe(false);
+  });
+
+  it('treats an ungraded metric as in target', () => {
+    expect(medianOverTarget(undefined)).toBe(false);
+  });
+});
+
+describe('passSeverity', () => {
+  it('does not paint a variable-but-fine target the same red as a broken one', () => {
+    // 8/10 and 0/10 both fail the 90% gate. Reporting them identically is what
+    // made a healthy page look like a regression.
+    expect(passSeverity({ meets: false, passRate: 0.8 })).toBe('yellow');
+    expect(passSeverity({ meets: false, passRate: 1 })).toBe('yellow');
+    expect(passSeverity({ meets: false, passRate: 0.6 })).toBe('red');
+    expect(passSeverity({ meets: false, passRate: 0 })).toBe('red');
+  });
+
+  it('is green when the target was met', () => {
+    expect(passSeverity({ meets: true, passRate: 1 })).toBe('green');
+  });
+
+  it('assumes the worst when the pass rate was never measured', () => {
+    // An absent pass rate is not evidence of health, so it must not read green.
+    expect(passSeverity({ meets: false })).toBe('red');
   });
 });
 

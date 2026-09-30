@@ -178,7 +178,9 @@ describe('cautions', () => {
   });
 
   it('warns about a bimodal score', () => {
-    const scores = [88, 87.5, 88.5, 88, 93.5, 94, 95.5, 93, 94.5, 95];
+    // Lanes ~30 apart, so the split is wide enough to be worth changing how the
+    // score is read.
+    const scores = [55, 56, 54.5, 55.5, 88, 90, 87.5, 89.5, 91, 88.5];
     const runs = scores.map((s, i) => {
       const run = normalizeLh13();
       run.fetchTime = `2026-09-30T03-4${i}-00Z`;
@@ -188,6 +190,23 @@ describe('cautions', () => {
     });
     const report = applyTargets(aggregateReports(runs, { reportId: 'r', runsRequested: 10 }), TARGETS);
     expect(diagnose(report).cautions.join(' ')).toMatch(/[Bb]imodal/);
+  });
+
+  it('stays quiet about a bimodal score whose lanes are too close to act on', () => {
+    // Two lanes ~6 apart on a 0-100 scale. Statistically a split, but telling
+    // the reader to "compare lane-to-lane" about a 6-point gap trains them to
+    // ignore every line this section emits.
+    const scores = [88, 87.5, 88.5, 88, 93.5, 94, 95.5, 93, 94.5, 95];
+    const runs = scores.map((s, i) => {
+      const run = normalizeLh13();
+      run.fetchTime = `2026-09-30T03-4${i}-00Z`;
+      run.score = s;
+      run.metrics = { lcp: 2400, tbt: 100, cls: 0.01, fcp: 1500, speedIndex: 3000 } as AggregatedReport['metrics'];
+      return run;
+    });
+    const report = applyTargets(aggregateReports(runs, { reportId: 'r', runsRequested: 10 }), TARGETS);
+    expect(report.distributions?.score?.bimodal).toBe(true);
+    expect(diagnose(report).cautions.join(' ')).not.toMatch(/[Bb]imodal/);
   });
 });
 

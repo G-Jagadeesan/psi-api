@@ -20,7 +20,9 @@ import {
   lighthouseLabel,
   metricDelta,
   metricValue,
+  medianOverTarget,
   passCount,
+  passSeverity,
   paint,
   renderTable,
   savingsLabel,
@@ -123,7 +125,7 @@ Examples:
 
 Output:
   The default view leads with a verdict, then a metric table where every row
-  shares one bar scale and the budget is marked on the bar. The --diagnose
+  shares one bar scale and the target is marked on the bar. The --diagnose
   flag ranks the work queue against the metrics that are actually failing.
 
   https://example.com/zen-class/data-science-course/
@@ -135,9 +137,9 @@ Output:
   VERDICT  FAIL  1 of 6 targets failing
           FCP 2154ms vs 1800ms (0/10 runs in target)
 
-    METRIC       MEDIAN  BUDGET  VERDICT      RUNS IN BUDGET
+    METRIC       MEDIAN  TARGET  VERDICT      RUNS IN TARGET
     FCP          2154ms  1800ms  +354ms over            0/10  ███████┃····
-    LCP          2401ms  2500ms  in budget             10/10  ████████┃···
+    LCP          2401ms  2500ms  in target             10/10  ████████┃···
 
   The "measured under" line records the device, CPU benchmark, locale and
   categories the run was taken with. Two reports are only comparable when they
@@ -555,35 +557,27 @@ function budgetCells(
     const gap = entry.gap;
     const actual = entry.actual ?? gap?.actual ?? 0;
     const target = gap?.target ?? 0;
-    const meets = gap?.meets ?? true;
     const bar = barSegments(actual, target, scale);
+    // One decision, reused by the bar, the label and the verdict text, so they
+    // cannot disagree with each other.
+    const over = medianOverTarget(gap);
     const barText =
-      // The bar colours the median's position against the budget line, which is
-      // what the eye reads at a glance. Whether enough runs held it is the next
-      // column's job, and colouring the bar by that instead would make a
-      // median-passing metric look broken.
-      paint(bar.over ? 'red' : 'green', bar.fill + bar.lead, useColor) +
+      paint(over ? 'red' : 'green', bar.fill + bar.lead, useColor) +
       paint('cyan', bar.tick, useColor) +
       paint('dim', bar.rest, useColor);
     return [
-      meets ? entry.label : paint('red', entry.label, useColor),
+      // The label and the verdict text are coloured on the median's position
+      // against the target, never on `meets` - see `medianOverTarget`.
+      over ? paint('red', entry.label, useColor) : entry.label,
       metricValue(entry.key, actual),
       gap ? metricValue(entry.key, gap.target) : ABSENT,
-      gap
-        ? paint(meets ? 'green' : 'red', metricDelta(entry.key, gap.delta), useColor)
-        : ABSENT,
-      gap ? paint(passPaint(gap), passCount(gap), useColor) : ABSENT,
+      gap ? paint(over ? 'red' : 'green', metricDelta(entry.key, gap.delta), useColor) : ABSENT,
+      gap ? paint(passSeverity(gap), passCount(gap), useColor) : ABSENT,
       barText,
     ];
   });
 }
 
-/** Colour for a pass-rate cell: green only when every measured run held. */
-function passPaint(gap: Gap): 'green' | 'yellow' | 'red' {
-  if (gap.meets) return 'green';
-  if (gap.passRate !== undefined && gap.passRate >= 0.9) return 'yellow';
-  return 'red';
-}
 
 /**
  * A wrapped SOP line, with the guide section picked out.
@@ -649,9 +643,14 @@ function renderHuman(options: CliOptions, report: Awaited<ReturnType<typeof runR
       `${targetText}   ` +
       paint('dim', spread, useColor),
   );
-  if (report.distributions?.score?.bimodal) {
+  // Gated on the note, not on `bimodal`. The two are separate claims: the
+  // distribution can be a real split that is too small to act on, in which case
+  // there is nothing to say and the sentence has to be omitted entirely rather
+  // than printed with nothing after the colon.
+  const scoreSplit = report.distributions?.score;
+  if (scoreSplit?.bimodal && scoreSplit.note) {
     lines.push(
-      paint('yellow', `         the score splits into two groups: ${report.distributions.score.note}`, useColor),
+      paint('yellow', `         the score splits into two groups: ${scoreSplit.note}`, useColor),
     );
   }
   lines.push('');
@@ -738,9 +737,9 @@ function renderDiagnosis(report: AggregatedReport, options: CliOptions): string 
   );
   lines.push('');
 
-  lines.push(paint('bold', 'BUDGETS FAILING', useColor));
+  lines.push(paint('bold', 'TARGETS FAILING', useColor));
   if (diagnosis.priorityOrder.length === 0) {
-    lines.push(paint('green', `${INDENT}every measured metric is inside its budget`, useColor));
+    lines.push(paint('green', `${INDENT}every measured metric is inside its target`, useColor));
   } else {
     const scale = Math.max(
       ...diagnosis.priorityOrder.map((gap) => Math.max(gap.actual, gap.target)),
@@ -1073,15 +1072,15 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
         },
         onRunFinished: ({ run, ok, score, error }) => {
           if (options.json) return;
-          // Rewritten in place on a tty so ten runs are one line of progress
-          // rather than ten, and a plain appended line everywhere else, where a
-          // carriage return would only corrupt a log file.
+          // One line per run, appended and never rewritten. A carriage return
+          // would leave a single line that overwrites itself, which hides the
+          // per-run spread the reader needs in order to judge the aggregate
+          // that follows - and a report whose runs cannot be seen individually
+          // cannot be checked for the cached-timestamp failure mode.
           const label = ok
             ? `run ${run}/${options.runs}  score ${Math.round(score as number)}`
             : `run ${run}/${options.runs}  FAILED  ${error}`;
-          const line = process.stderr.isTTY ? `\r${label}` : `${label}\n`;
-          process.stderr.write(line);
-          if (ok && run === options.runs) process.stderr.write('\n');
+          process.stderr.write(`${ok ? label : paint('yellow', label, false)}\n`);
         },
       });
       report = result.report;

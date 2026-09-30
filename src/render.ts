@@ -44,9 +44,18 @@ export function paint(code: CodeName, text: string, enabled: boolean): string {
   return enabled ? `${CODES[code]}${text}${RESET}` : text;
 }
 
-/** Whether the current stdout can render colour. */
+/**
+ * Whether the current stdout can render colour.
+ *
+ * `FORCE_COLOR` and `NO_COLOR` are both honoured because they are the only way
+ * to see the real output when stdout is a pipe - which is exactly how this tool
+ * runs under CI, and how anyone captures its output to check it. `NO_COLOR` wins
+ * when both are set, so a user can always force plain text.
+ */
 export function colorEnabled(): boolean {
-  return process.stdout.isTTY === true && !process.env.NO_COLOR;
+  if (process.env.NO_COLOR) return false;
+  if (process.env.FORCE_COLOR) return process.env.FORCE_COLOR !== '0';
+  return process.stdout.isTTY === true;
 }
 
 const ANSI_PATTERN = new RegExp(`${ESC}\\[[0-9;]*m`, 'g');
@@ -430,7 +439,7 @@ function round1(value: number): number {
  * verdict is a separate column.
  */
 export function metricDelta(metric: string, delta: number): string {
-  if (delta <= 0) return 'in budget';
+  if (delta <= 0) return 'in target';
   const rounded = metric === 'cls' ? delta.toFixed(3) : `${Math.round(delta)}ms`;
   return `+${rounded} over`;
 }
@@ -460,7 +469,7 @@ export function savingsLabel(ms: number | null, bytes: number | null): string {
   return ABSENT;
 }
 
-/** How many runs a budget held, as `in/total`, or `ABSENT` when unmeasured. */
+/** How many runs a target held, as `in/total`, or `ABSENT` when unmeasured. */
 export function passCount(gap: {
   passRate?: number;
   runsMeasured?: number;
@@ -468,6 +477,40 @@ export function passCount(gap: {
 }): string {
   if (gap.runsMeasured === undefined || gap.overBudgetRuns === undefined) return ABSENT;
   return `${gap.runsMeasured - gap.overBudgetRuns}/${gap.runsMeasured}`;
+}
+
+/**
+ * How severe a metric's tail failures are, as a colour.
+ *
+ * Separate from `Gap.meets` on purpose. `meets` is a pass/fail verdict on the
+ * tail, and colouring straight off it paints a target that held in 8 of 10 runs
+ * the same red as one that held in none - which reads as "broken" when the page
+ * is fine and merely variable, and is how a healthy row ends up looking like a
+ * regression.
+ *
+ * Red is reserved for the case worth stopping work over: a third or more of real
+ * sessions missing the target. Between the graded threshold and that, the honest
+ * signal is "mostly holding, watch it".
+ */
+export function passSeverity(gap: {
+  meets: boolean;
+  passRate?: number;
+}): 'green' | 'yellow' | 'red' {
+  if (gap.meets) return 'green';
+  if (gap.passRate !== undefined && gap.passRate >= 0.7) return 'yellow';
+  return 'red';
+}
+
+/**
+ * Whether a metric's *median* is over its target.
+ *
+ * The row label, the bar and the verdict text are all coloured off this, never
+ * off `meets`. A metric can hold its target on the median while failing the
+ * pass-rate gate, and colouring the whole row off the gate puts the word "in
+ * target" next to a colour that contradicts it. The tail has its own column.
+ */
+export function medianOverTarget(gap: { delta: number } | undefined): boolean {
+  return gap !== undefined && gap.delta > 0;
 }
 
 /** `min`, `max` and the interquartile range, skipping whatever is not recorded. */

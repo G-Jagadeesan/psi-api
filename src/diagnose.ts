@@ -300,8 +300,11 @@ export function rankInsights(
 function cautionsFor(report: AggregatedReport, ranked: RankedInsight[]): string[] {
   const cautions: string[] = [];
 
+  // Gated on `note`, not on `bimodal`: a split can be statistically real and too
+  // small to act on, and a caution with an empty bracket in it is worse than no
+  // caution at all - it reads as a bug in the tool.
   const scoreDist = report.distributions?.score;
-  if (scoreDist?.bimodal) {
+  if (scoreDist?.bimodal && scoreDist.note) {
     cautions.push(
       `Score is bimodal (${scoreDist.note}). Compare lane-to-lane, not median-to-median: ` +
         'a median sitting in one lane reflects run count, not page behaviour.',

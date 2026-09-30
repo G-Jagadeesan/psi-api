@@ -222,10 +222,19 @@ export function detectDistribution(values: number[]): Distribution {
     const [slow, fast] = lanesArray[0] && lanesArray[0]!.value <= (lanesArray[1]?.value ?? 0)
       ? lanesArray
       : [...lanesArray].reverse();
+    // The note is the *actionable* half of the claim, and it is gated separately
+    // from `bimodal`. Two lanes six points apart on a 0-100 score are a real
+    // statistical split but not a difference anyone should act on, and printing
+    // "the median sits in one lane by run count" about a 1-point spread trains
+    // the reader to ignore the line. Left undefined rather than set to an empty
+    // string, so a caller testing for a note sees the same thing either way.
     const distance = fast != null && slow != null ? round(fast.value - slow.value, 0) : 0;
-    result.note = distance > 10
-      ? `Bimodal: ${pct(slow?.share ?? 0)} of runs at ~${round(slow?.value ?? 0, 0)} and ${pct(fast?.share ?? 0)} at ~${round(fast?.value ?? 0, 0)}. The median sits in one lane by run count, not because the page reliably performs there.`
-      : '';
+    if (distance > 10) {
+      result.note =
+        `Bimodal: ${pct(slow?.share ?? 0)} of runs at ~${round(slow?.value ?? 0, 0)} and ` +
+        `${pct(fast?.share ?? 0)} at ~${round(fast?.value ?? 0, 0)}. The median sits in one lane ` +
+        'by run count, not because the page reliably performs there.';
+    }
   }
   return result;
 }
