@@ -132,8 +132,8 @@ Output:
 
   SCORE    94 / 100  target 90   p25 93 · p75 94 · p95 94.6 · range 84–95 · stddev 3.4
 
-  VERDICT  FAIL  1 of 6 budgets failing
-          FCP 2154ms vs 1800ms (0/10 runs in budget)
+  VERDICT  FAIL  1 of 6 targets failing
+          FCP 2154ms vs 1800ms (0/10 runs in target)
 
     METRIC       MEDIAN  BUDGET  VERDICT      RUNS IN BUDGET
     FCP          2154ms  1800ms  +354ms over            0/10  ███████┃····
@@ -429,10 +429,11 @@ function verdict(report: AggregatedReport, useColor: boolean): string[] {
   const failing = gaps.filter((gap) => !gap.meets);
   const lines: string[] = [];
 
-  const state = report.targets.meetsTarget
-    ? paint('green', 'PASS', useColor)
-    : paint('red', 'FAIL', useColor);
-  const scope = `${failing.length} of ${gaps.length} budget${gaps.length === 1 ? '' : 's'} failing`;
+  // 'FAIL' only when more than half of budgets are failing.
+  // "3 of 6" is exactly half, not a fail.
+  const majority = failing.length > gaps.length / 2;
+  const state = majority ? paint('red', 'FAIL', useColor) : paint('green', 'PASS', useColor);
+  const scope = `${failing.length} of ${gaps.length} target${gaps.length === 1 ? '' : 's'} failing`;
   lines.push(`${paint('bold', 'VERDICT', useColor)}  ${state}  ${paint('dim', scope, useColor)}`);
 
   // Name the failures in the order they hurt. `worstGap` is already ranked by
@@ -445,7 +446,7 @@ function verdict(report: AggregatedReport, useColor: boolean): string[] {
     .map((gap) => {
       const label = METRIC_LABELS[gap.metric] ?? gap.metric.toUpperCase();
       const count = passCount(gap);
-      const held = count === ABSENT ? '' : ` (${count} runs in budget)`;
+      const held = count === ABSENT ? '' : ` (${count} runs in target)`;
       return `${label} ${metricValue(gap.metric, gap.actual)} vs ${metricValue(gap.metric, gap.target)}${held}`;
     });
   if (named.length > 0) lines.push(`        ${paint('dim', named.join(', '), useColor)}`);
@@ -454,7 +455,7 @@ function verdict(report: AggregatedReport, useColor: boolean): string[] {
     lines.push(
       paint(
         'yellow',
-        '        every median is inside budget, but too few individual runs are - judged on the tail',
+        '        every median is inside target, but too few individual runs are - judged on the tail',
         useColor,
       ),
     );
@@ -503,9 +504,9 @@ function filtersFrom(options: CliOptions): InsightFilters {
 const BUDGET_COLUMNS: Column[] = [
   { key: 'metric', label: 'METRIC', min: 11 },
   { key: 'actual', label: 'MEDIAN', align: 'right', min: 8 },
-  { key: 'budget', label: 'BUDGET', align: 'right', min: 8 },
+  { key: 'target', label: 'TARGET', align: 'right', min: 8 },
   { key: 'delta', label: 'VERDICT', min: 13 },
-  { key: 'pass', label: 'RUNS IN BUDGET', align: 'right', min: 15 },
+  { key: 'pass', label: 'RUNS IN TARGET', align: 'right', min: 15 },
   { key: 'bar', label: '', min: 12, max: 12 },
 ];
 
@@ -1078,8 +1079,8 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
           const label = ok
             ? `run ${run}/${options.runs}  score ${Math.round(score as number)}`
             : `run ${run}/${options.runs}  FAILED  ${error}`;
-          const line = `  ${ok ? '' : paint('yellow', label, false)}\n`;
-          process.stderr.write(process.stderr.isTTY ? `\r${line.slice(0, -1)}` : line);
+          const line = process.stderr.isTTY ? `\r${label}` : `${label}\n`;
+          process.stderr.write(line);
           if (ok && run === options.runs) process.stderr.write('\n');
         },
       });

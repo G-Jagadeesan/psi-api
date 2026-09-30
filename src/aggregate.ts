@@ -218,11 +218,14 @@ export function detectDistribution(values: number[]): Distribution {
 
   const result: Distribution = { bimodal, lanes, separation: round(ratio, 2) };
   if (bimodal) {
-    const [slow, fast] = lanes[0] && lanes[0]!.value <= (lanes[1]?.value ?? 0) ? lanes : [...lanes].reverse();
-    result.note =
-      `Bimodal: ${pct(slow?.share ?? 0)} of runs at ~${round(slow?.value ?? 0, 0)} and ` +
-      `${pct(fast?.share ?? 0)} at ~${round(fast?.value ?? 0, 0)}. The median sits in one lane ` +
-      'by run count, not because the page reliably performs there.';
+    const lanesArray = lanes ?? [];
+    const [slow, fast] = lanesArray[0] && lanesArray[0]!.value <= (lanesArray[1]?.value ?? 0)
+      ? lanesArray
+      : [...lanesArray].reverse();
+    const distance = fast != null && slow != null ? round(fast.value - slow.value, 0) : 0;
+    result.note = distance > 10
+      ? `Bimodal: ${pct(slow?.share ?? 0)} of runs at ~${round(slow?.value ?? 0, 0)} and ${pct(fast?.share ?? 0)} at ~${round(fast?.value ?? 0, 0)}. The median sits in one lane by run count, not because the page reliably performs there.`
+      : '';
   }
   return result;
 }
