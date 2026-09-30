@@ -10,6 +10,7 @@ import { z } from 'zod';
 import type { AggregatedReport, FilterGroup, Job, MetricKey, SortField, SortOrder } from './types.js';
 import { METRIC_KEYS, STATS, STRATEGIES } from './types.js';
 import { filterInsights } from './insights.js';
+import { diagnose } from './diagnose.js';
 import { InsufficientRunsError, MAX_RUNS, runReport } from './runner.js';
 import { UrlValidationError } from './psiClient.js';
 import { loadReport } from './storage.js';
@@ -17,7 +18,7 @@ import { loadReport } from './storage.js';
 loadEnv();
 
 const FILTER_GROUPS = ['opportunity', 'diagnostic', 'passed', 'informative'] as const;
-const SORT_FIELDS = ['savingsMs', 'savingsBytes', 'score'] as const;
+const SORT_FIELDS = ['savingsMs', 'savingsBytes', 'score', 'firstPartyShare'] as const;
 const ORDERS = ['asc', 'desc'] as const;
 const PARTIES = ['any', 'first', 'third'] as const;
 
@@ -76,6 +77,7 @@ const filterParams = z.object({
   id: csv().optional(),
   hasItems: boolish.optional(),
   party: z.enum(PARTIES).default('any'),
+  minFirstPartyRatio: numericParam.pipe(z.number().min(0).max(1)).optional(),
   sortBy: z.enum(SORT_FIELDS).default('savingsMs'),
   order: z.enum(ORDERS).default('desc'),
   limit: numericParam.pipe(z.number().int().min(0)).optional(),
@@ -211,6 +213,7 @@ function insightsPayload(report: AggregatedReport, filters: FilterParams) {
     id: filters.id as string[] | undefined,
     hasItems: filters.hasItems,
     party: filters.party,
+    minFirstPartyRatio: filters.minFirstPartyRatio,
     sortBy: filters.sortBy as SortField,
     order: filters.order as SortOrder,
     limit: filters.limit,
@@ -227,11 +230,27 @@ function insightsPayload(report: AggregatedReport, filters: FilterParams) {
     headline: report.headline,
     targets: report.targets,
     score: report.score,
+    distributions: report.distributions,
+    lcp: report.lcp,
     totalInsights: report.insights.length,
     matched: insights.length,
     filters: typed,
     insights,
   };
+}
+
+/** The ranked work queue, same ranking the CLI's `--diagnose` prints. */
+function diagnosisPayload(report: AggregatedReport, filters: FilterParams) {
+  return diagnose(report, {
+    filters: {
+      group: filters.group as FilterGroup[] | undefined,
+      party: filters.party,
+      minFirstPartyRatio: filters.minFirstPartyRatio,
+      sortBy: filters.sortBy as SortField,
+      limit: filters.limit,
+      includeFlaky: filters.includeFlaky,
+    },
+  });
 }
 
 /* ---------------------------------- server ---------------------------------- */
@@ -315,6 +334,30 @@ export function buildServer(): FastifyInstance {
           .send({ error: { code: 'NOT_FOUND', message: `no stored report "${req.params.reportId}"` } });
       }
       return reply.send(insightsPayload(report, filterParams.parse(compact(req.query))));
+    },
+  );
+
+  // Ranked work queue. Same ranking the CLI's --diagnose prints, so a machine
+  // consumer does not have to reimplement the prioritisation.
+  app.get<{ Params: { reportId: string }; Querystring: Record<string, unknown> }>(
+    '/report/:reportId/diagnosis',
+    async (req, reply) => {
+      const report = await findReport(req.params.reportId);
+      if (!report) {
+        return reply
+          .status(404)
+          .send({ error: { code: 'NOT_FOUND', message: `no stored report "${req.params.reportId}"` } });
+      }
+      return reply.send({
+        reportId: report.reportId,
+        url: report.url,
+        strategy: report.strategy,
+        headline: report.headline,
+        targets: report.targets,
+        lcp: report.lcp,
+        distributions: report.distributions,
+        ...diagnosisPayload(report, filterParams.parse(compact(req.query))),
+      });
     },
   );
 

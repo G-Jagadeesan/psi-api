@@ -1,7 +1,9 @@
 import type {
   AggregatedInsight,
   AggregatedReport,
+  Distribution,
   Insight,
+  Lane,
   MetricKey,
   Metrics,
   NormalizedReport,
@@ -11,9 +13,32 @@ import type {
   StatTriple,
 } from './types.js';
 import { METRIC_KEYS, STATS } from './types.js';
+import { lcpDetailFrom } from './insights.js';
 
 export const FLAKY_THRESHOLD = 0.3;
 export const MIN_SUCCESS_RATIO = 0.6;
+
+/**
+ * Minimum samples before a two-lane split is even attempted.
+ *
+ * Below this, a "lane" is two or three points and any split is an artefact.
+ */
+const MIN_LANE_SAMPLES = 6;
+
+/** Both lanes must hold at least this share of the samples to count as real. */
+const MIN_LANE_SHARE = 0.2;
+
+/**
+ * Separation needed before a split is called bimodal.
+ *
+ * Calibrated against the observed data rather than guessed. A uniform spread -
+ * the best case for "this is just jitter" - scores about 3.2, because splitting
+ * a uniform population in half still puts its means half a range apart while its
+ * pooled spread stays small. The genuine boundary-cliff case in the stored
+ * reports, scores clustered at 87.5-88.5 and 93-95.5, scores about 8.0. 4.0 sits
+ * above the jitter ceiling and well below a real split.
+ */
+const MIN_SEPARATION = 4;
 
 /**
  * Bucket width per metric for the `mode` statistic. Continuous values have to be
@@ -101,6 +126,114 @@ export function stddev(values: number[]): number {
   return Math.sqrt(variance);
 }
 
+/**
+ * Linear-interpolated percentile (the PERCENTILE.INC convention).
+ *
+ * `p` is a fraction in 0-1. Uses the same index formula as `median` so the
+ * median stays exactly the p50 of this function - the two can never disagree.
+ */
+export function percentile(values: number[], p: number): number {
+  if (values.length === 0) return 0;
+  const sorted = [...values].sort((a, b) => a - b);
+  if (sorted.length === 1) return sorted[0] as number;
+
+  const rank = (sorted.length - 1) * Math.min(Math.max(p, 0), 1);
+  const lower = Math.floor(rank);
+  const upper = Math.ceil(rank);
+  if (lower === upper) return sorted[lower] as number;
+  const weight = rank - lower;
+  return (sorted[lower] as number) * (1 - weight) + (sorted[upper] as number) * weight;
+}
+
+/**
+ * How far apart two clusters are, in units of their own spread.
+ *
+ * 1 means "one continuous population"; large means "two different worlds".
+ * Uses the between-cluster separation over the pooled within-cluster variance,
+ * which is the ratio that stays meaningful when the overall stddev is inflated
+ * by the very gap being measured.
+ */
+function separation(between: number, withinSquares: number, totalCount: number): number {
+  if (withinSquares <= 0) return between > 0 ? Number.POSITIVE_INFINITY : 0;
+  // Unbiased pooled within-cluster standard deviation.
+  const df = Math.max(totalCount - 2, 1);
+  const withinSd = Math.sqrt(withinSquares / df);
+  if (withinSd === 0) return between > 0 ? Number.POSITIVE_INFINITY : 0;
+  return between / withinSd;
+}
+
+/**
+ * Split samples into two lanes when they genuinely cluster, rather than smear.
+ *
+ * The split point is chosen to minimise within-lane variance (Otsu's method in
+ * one dimension), so it is not a tunable threshold - it is the best 2-means
+ * partition of these samples. Two guards stop it from firing on ordinary noise:
+ * each lane must hold `MIN_LANE_SHARE` of the samples, and the separation must
+ * exceed `MIN_SEPARATION`.
+ *
+ * This matters because Lighthouse scores off a log-normal curve. A metric
+ * resting on a scoring boundary produces two stable clusters, the median lands
+ * in whichever one got more runs, and a single headline number then describes
+ * neither lane.
+ */
+export function detectDistribution(values: number[]): Distribution {
+  const empty: Distribution = { bimodal: false, lanes: [], separation: 0 };
+  if (values.length < MIN_LANE_SAMPLES) return empty;
+
+  const sorted = [...values].sort((a, b) => a - b);
+
+  let bestSquares = Number.POSITIVE_INFINITY;
+  let bestIndex = -1;
+  for (let i = 1; i < sorted.length; i += 1) {
+    const left = sorted.slice(0, i) as number[];
+    const right = sorted.slice(i) as number[];
+    // Splitting exactly between two equal values carries no information.
+    if (left[left.length - 1] === right[0]) continue;
+    const squares = sumSquaredDeviations(left) + sumSquaredDeviations(right);
+    if (squares < bestSquares) {
+      bestSquares = squares;
+      bestIndex = i;
+    }
+  }
+  if (bestIndex < 0) return empty;
+
+  const leftValues = sorted.slice(0, bestIndex) as number[];
+  const rightValues = sorted.slice(bestIndex) as number[];
+  const leftMean = mean(leftValues);
+  const rightMean = mean(rightValues);
+  const ratio = separation(Math.abs(rightMean - leftMean), bestSquares, sorted.length);
+
+  const toLane = (vals: number[]): Lane => ({
+    from: Math.min(...vals),
+    to: Math.max(...vals),
+    count: vals.length,
+    share: round(vals.length / sorted.length, 4),
+    value: round(median(vals), 4),
+  });
+
+  const lanes = [toLane(leftValues), toLane(rightValues)];
+  const share = Math.min(lanes[0]?.share ?? 0, lanes[1]?.share ?? 0);
+  const bimodal = share >= MIN_LANE_SHARE && ratio >= MIN_SEPARATION;
+
+  const result: Distribution = { bimodal, lanes, separation: round(ratio, 2) };
+  if (bimodal) {
+    const [slow, fast] = lanes[0] && lanes[0]!.value <= (lanes[1]?.value ?? 0) ? lanes : [...lanes].reverse();
+    result.note =
+      `Bimodal: ${pct(slow?.share ?? 0)} of runs at ~${round(slow?.value ?? 0, 0)} and ` +
+      `${pct(fast?.share ?? 0)} at ~${round(fast?.value ?? 0, 0)}. The median sits in one lane ` +
+      'by run count, not because the page reliably performs there.';
+  }
+  return result;
+}
+
+function sumSquaredDeviations(values: number[]): number {
+  if (values.length === 0) return 0;
+  const avg = mean(values);
+  return values.reduce((sum, value) => sum + (value - avg) ** 2, 0);
+}
+
+const pct = (share: number): string => `${Math.round(share * 100)}%`;
+
 export function statTriple(values: number[], metricName: string): StatTriple {
   const width = bucketWidth(metricName);
   return {
@@ -119,7 +252,28 @@ export function seriesStats(values: number[], metricName: string): SeriesStats {
     stddev: round(stddev(values), 4),
     count: values.length,
     values: [...values],
+    p25: round(percentile(values, 0.25), 4),
+    p75: round(percentile(values, 0.75), 4),
+    p95: round(percentile(values, 0.95), 4),
   };
+}
+
+/**
+ * Bimodality for one metric, reported under its own key so a caller can compare
+ * distributions instead of guessing from a single number.
+ */
+export function distributionsFor(
+  score: SeriesStats,
+  metrics: Partial<Record<MetricKey, SeriesStats>>,
+): Partial<Record<'score' | MetricKey, Distribution>> {
+  const out: Partial<Record<'score' | MetricKey, Distribution>> = {
+    score: detectDistribution(score.values),
+  };
+  for (const key of METRIC_KEYS) {
+    const m = metrics[key];
+    if (m) out[key] = detectDistribution(m.values);
+  }
+  return out;
 }
 
 function pickStat(stats: SeriesStats, stat: Stat): number {
@@ -317,6 +471,8 @@ export function aggregateReports(
     headline: { score: pickStat(score, stat), metrics: headlineMetrics },
     score,
     metrics,
+    distributions: distributionsFor(score, metrics),
+    lcp: lcpDetailFrom(reports, score.median),
     stats: statsByStat,
     insights: aggregateInsights(reports, score.median, stat),
     fieldData: first?.fieldData ?? null,

@@ -46,6 +46,8 @@ export interface Insight {
   savingsMs: number | null;
   /** Null means "Lighthouse gave no estimate" - which is not the same as zero. */
   savingsBytes: number | null;
+  /** Where the savings number was actually found, for auditing a suspicious estimate. */
+  savingsSource?: SavingsSource;
   metricsAffected?: string[];
   items?: unknown[];
   /** Raw `details.items` length before trimming to the top 25. */
@@ -56,7 +58,26 @@ export interface Insight {
   thirdPartyItems: number;
   /** Distinct hosts behind the items, capped for readability. */
   itemHosts: string[];
+  /**
+   * Share of this insight's cost that is yours, 0-1; `null` when unattributed.
+   *
+   * A value strictly between 0 and 1 means the insight is *mixed*: some rows are
+   * your own domain and some are a vendor's. Dropping a mixed insight wholesale
+   * throws away the part you control, so this is what `--party first` ranks by
+   * and what `--minFirstPartyRatio` filters on.
+   */
+  firstPartyShare?: FirstPartyShare;
 }
+
+/**
+ * Which field a savings estimate was recovered from.
+ *
+ * Recorded because the sources disagree in practice: `details.overallSavingsMs`
+ * is the rollup Lighthouse writes for its own UI, the per-item sum is what the
+ * rows actually add up to, and `displayValue` is the human string that is the
+ * *only* place some Lighthouse 13 audits put the number.
+ */
+export type SavingsSource = 'overall' | 'metricSavings' | 'items' | 'displayValue' | 'none';
 
 /** CrUX field data, passed through untouched when the origin has real users. */
 export interface FieldData {
@@ -86,6 +107,50 @@ export interface SeriesStats {
   stddev: number;
   count: number;
   values: number[];
+  /**
+   * Quartiles, linear-interpolated (the PERCENTILE.INC convention).
+   *
+   * These exist because the mean/median/mode trio describes the *centre* of a
+   * distribution and nothing else. A page whose LCP alternates between 2.4s and
+   * 3.0s has a perfectly respectable median and a 95th percentile well over
+   * budget, and a performance budget is a statement about the tail.
+   */
+  p25: number;
+  p75: number;
+  p95: number;
+}
+
+/**
+ * One cluster of a bimodal distribution.
+ *
+ * Lighthouse scores off a log-normal curve, so a metric sitting on a scoring
+ * boundary produces two stable clusters rather than one smear - and the median
+ * then reports "whichever lane happened to get more runs", which is not a
+ * property of the page at all.
+ */
+export interface Lane {
+  /** Inclusive lower bound of the cluster. */
+  from: number;
+  /** Inclusive upper bound of the cluster. */
+  to: number;
+  count: number;
+  /** Share of samples in this lane, 0-1. */
+  share: number;
+  /** Median of the lane - the honest headline for that lane. */
+  value: number;
+}
+
+export interface Distribution {
+  /** True when the samples split into two well-separated, meaningfully sized lanes. */
+  bimodal: boolean;
+  lanes: Lane[];
+  /**
+   * Between-lane separation over pooled within-lane spread. 1 means the split
+   * explains nothing; large means the two lanes are genuinely different worlds.
+   */
+  separation: number;
+  /** Human-readable reason, present when `bimodal` is true. */
+  note?: string;
 }
 
 export type StatTriple = Record<Stat, number>;
@@ -111,6 +176,21 @@ export interface Gap {
   /** actual - target. Positive for "budget" metrics means over budget. */
   delta: number;
   meets: boolean;
+  /**
+   * Share of individual runs that were inside budget, 0-1.
+   *
+   * Only present when the per-run distribution was supplied. A median can sit
+   * comfortably inside a budget while a fifth of real measurements blow straight
+   * through it, and an SLO is a claim about the tail, not about the middle.
+   */
+  passRate?: number;
+  /** How many runs were measured for this metric. */
+  runsMeasured?: number;
+  /** How many of those runs were over budget. */
+  overBudgetRuns?: number;
+  /** 75th/95th percentile, when available. */
+  p75?: number;
+  p95?: number;
 }
 
 export interface TargetComparison {
@@ -118,6 +198,19 @@ export interface TargetComparison {
   targets: Record<string, number>;
   meetsTarget: boolean;
   gaps: Gap[];
+  /** The gap that is worst relative to its own budget - the one to work on. */
+  worstGap?: Gap;
+  /** True when the median alone would have passed but too few runs did. */
+  medianPass?: boolean;
+  /**
+   * Metrics the page cannot reach through frontend work, with the reason.
+   *
+   * Set when the budget sits below what the server response alone already costs
+   * (TTFB), or when the remaining work is owned by a third party. Without this
+   * the loop burns every remaining iteration chasing a number that no
+   * SOP-permitted change can move.
+   */
+  blockedBy?: string[];
 }
 
 export interface RunFailure {
@@ -144,6 +237,10 @@ export interface AggregatedReport {
   /** All three stats side by side, plus spread, for the whole run set. */
   score: SeriesStats;
   metrics: Partial<Record<MetricKey, SeriesStats>>;
+  /** Whether the headline score splits into two lanes, per metric. */
+  distributions: Partial<Record<'score' | MetricKey, Distribution>>;
+  /** What the LCP element actually is, and where its time went. */
+  lcp: LcpDetail | null;
   /** Same aggregate recomputed with each stat, for easy comparison. */
   stats: Record<Stat, { score: number; metrics: Metrics }>;
   insights: AggregatedInsight[];
@@ -152,15 +249,67 @@ export interface AggregatedReport {
   errors: RunFailure[];
 }
 
-export type SortField = 'savingsMs' | 'savingsBytes' | 'score';
+export type SortField = 'savingsMs' | 'savingsBytes' | 'score' | 'firstPartyShare';
 export type SortOrder = 'asc' | 'desc';
 
 /**
+ * The four LCP phases Lighthouse reports, in order.
+ *
+ * `loadDelay` and `loadTime` are absent when the LCP element is text, because
+ * there is no resource to load. That absence is the single most useful thing to
+ * know: it means the image playbook does not apply, and the cost is elsewhere.
+ */
+export interface LcpPhases {
+  /** Server round trip. Owned by the backend / CDN, never by a component. */
+  ttfb?: number;
+  /** Between TTFB and the LCP resource starting to load. */
+  loadDelay?: number;
+  /** Duration of the LCP resource load itself. */
+  loadTime?: number;
+  /** Load complete (or text ready) to first paint of the element. */
+  renderDelay?: number;
+}
+
+export interface LcpDetail {
+  /** Lighthouse's own label for the element, e.g. `DIV`. */
+  elementType?: string;
+  /** The `nodeLabel` text content, when Lighthouse captured one. */
+  text?: string;
+  selector?: string;
+  snippet?: string;
+  /** True when the LCP element is text, so no image fix can move it. */
+  isText: boolean;
+  /** Sum of the reported phases, in ms. */
+  totalMs?: number;
+  phases: LcpPhases;
+  /** The single largest phase, for a one-line diagnosis. */
+  dominantPhase?: keyof LcpPhases;
+  /**
+   * Playbook the LCP cost belongs to, derived from the phase split rather than
+   * from the element tag: `server`, `resource` or `render`.
+   */
+  bottleneck: 'server' | 'resource' | 'render' | 'unknown';
+}
+
+/**
  * Which side of the wire an insight's cost sits on.
- * `first` keeps insights with no foreign-host cost, including ones Lighthouse
- * could not attribute to a URL at all - those are often the app's own code.
+ *
+ * `first` keeps every insight that carries any cost you own, plus ones Lighthouse
+ * could not attribute to a URL at all - those are often the app's own code. It
+ * only drops an insight whose cost is *entirely* somebody else's. A *mixed*
+ * insight (your CDN plus a vendor, in the same finding) is kept, because
+ * discarding it would throw away the rows you actually control.
  */
 export type PartyFilter = 'any' | 'first' | 'third';
+
+/**
+ * Share of an insight's cost that belongs to the measured site, 0-1.
+ *
+ * `null` means the cost is unattributed - Lighthouse could not tie the rows to
+ * any URL, which is normal for main-thread breakdowns and LCP phase tables. Those
+ * are frequently the site's own work, so they are deliberately not scored as 0.
+ */
+export type FirstPartyShare = number | null;
 
 export interface InsightFilters {
   group?: FilterGroup[];
@@ -173,6 +322,14 @@ export interface InsightFilters {
   hasItems?: boolean;
   /** Default `any`. */
   party?: PartyFilter;
+  /**
+   * Keep an insight only when at least this share of its cost is yours, 0-1.
+   *
+   * This is the honest form of `--party first`: it keeps mixed insights that are
+   * majority yours instead of discarding the whole finding because one row
+   * belongs to a vendor.
+   */
+  minFirstPartyRatio?: number;
   sortBy?: SortField;
   order?: SortOrder;
   limit?: number;

@@ -1,0 +1,263 @@
+{
+  "_comment": "Real Lighthouse 13 insight shapes, as observed on qwik-guvi-perf-fix.codingpuppet.com. The shipped raw-example.com.json fixture is Lighthouse 10-era (render-blocking-resources, positive overallSavingsMs). These audits are the shape the tool actually meets in production: overallSavingsMs: 0 with the real cost on the detail items, and savings that exist only inside displayValue.",
+  "lighthouseResult": {
+    "requestedUrl": "https://qwik-guvi-perf-fix.codingpuppet.com/",
+    "finalUrl": "https://qwik-guvi-perf-fix.codingpuppet.com/",
+    "fetchTime": "2026-09-30T03:46:22.811Z",
+    "lighthouseVersion": "13.5.0",
+    "categories": {
+      "performance": {
+        "score": 0.94,
+        "auditRefs": [
+          { "id": "first-contentful-paint", "group": "metrics" },
+          { "id": "largest-contentful-paint", "group": "metrics" },
+          { "id": "total-blocking-time", "group": "metrics" },
+          { "id": "cumulative-layout-shift", "group": "metrics" },
+          { "id": "speed-index", "group": "metrics" },
+          { "id": "server-response-time", "group": "metrics" },
+          { "id": "render-blocking-insight", "group": "diagnostics" },
+          { "id": "unused-javascript", "group": "diagnostics" },
+          { "id": "image-delivery-insight", "group": "diagnostics" },
+          { "id": "unused-css-rules", "group": "diagnostics" },
+          { "id": "lcp-breakdown-insight", "group": "diagnostics" },
+          { "id": "mainthread-work-breakdown", "group": "diagnostics" },
+          { "id": "third-parties-insight", "group": "diagnostics" }
+        ]
+      }
+    },
+    "audits": {
+      "first-contentful-paint": {
+        "id": "first-contentful-paint",
+        "title": "First Contentful Paint",
+        "score": 0.79,
+        "scoreDisplayMode": "numeric",
+        "numericValue": 2153.7799,
+        "numericUnit": "millisecond"
+      },
+      "largest-contentful-paint": {
+        "id": "largest-contentful-paint",
+        "title": "Largest Contentful Paint",
+        "score": 0.91,
+        "scoreDisplayMode": "numeric",
+        "numericValue": 2401,
+        "numericUnit": "millisecond"
+      },
+      "total-blocking-time": {
+        "id": "total-blocking-time",
+        "title": "Total Blocking Time",
+        "score": 0.97,
+        "scoreDisplayMode": "numeric",
+        "numericValue": 117.5,
+        "numericUnit": "millisecond"
+      },
+      "cumulative-layout-shift": {
+        "id": "cumulative-layout-shift",
+        "title": "Cumulative Layout Shift",
+        "score": 1,
+        "scoreDisplayMode": "numeric",
+        "numericValue": 0,
+        "numericUnit": "unitless"
+      },
+      "speed-index": {
+        "id": "speed-index",
+        "title": "Speed Index",
+        "score": 0.915,
+        "scoreDisplayMode": "numeric",
+        "numericValue": 3222.422,
+        "numericUnit": "millisecond"
+      },
+      "server-response-time": {
+        "id": "server-response-time",
+        "title": "Initial server response time was short",
+        "score": 1,
+        "scoreDisplayMode": "binary",
+        "numericValue": 562,
+        "numericUnit": "millisecond"
+      },
+
+      "render-blocking-insight": {
+        "id": "render-blocking-insight",
+        "title": "Eliminate render-blocking resources",
+        "description": "Resources are blocking the first paint of your page.",
+        "score": 0.5,
+        "scoreDisplayMode": "metricSavings",
+        "metricSavings": { "FCP": 0, "LCP": 0 },
+        "details": {
+          "type": "opportunity",
+          "overallSavingsMs": 0,
+          "overallSavingsBytes": 0,
+          "items": [
+            {
+              "url": "https://qwik-guvi-perf-fix.codingpuppet.com/assets/DgVpnMkC-style.css",
+              "totalBytes": 46725,
+              "wastedMs": 601
+            }
+          ]
+        }
+      },
+
+      "unused-javascript": {
+        "id": "unused-javascript",
+        "title": "Reduce unused JavaScript",
+        "description": "Reduce unused JavaScript to deliver bytes faster.",
+        "score": 0.5,
+        "scoreDisplayMode": "metricSavings",
+        "metricSavings": {},
+        "displayValue": "Est savings of 202 KiB",
+        "details": {
+          "type": "opportunity",
+          "overallSavingsMs": 0,
+          "items": [
+            {
+              "url": "https://qwik-guvi-perf-fix.codingpuppet.com/build/q-__EuPQ6J.js",
+              "totalBytes": 128641,
+              "wastedBytes": 120400,
+              "wastedPercent": 93.594
+            },
+            {
+              "url": "https://qwik-guvi-perf-fix.codingpuppet.com/build/q-CCsXXQ71.js",
+              "totalBytes": 68888,
+              "wastedBytes": 57200
+            },
+            {
+              "url": "https://qwik-guvi-perf-fix.codingpuppet.com/build/q-D31wtCEL.js",
+              "totalBytes": 47903,
+              "wastedBytes": 28000
+            }
+          ]
+        }
+      },
+
+      "image-delivery-insight": {
+        "id": "image-delivery-insight",
+        "title": "Improve image delivery",
+        "description": "Reducing the download time of images can improve perceived load time.",
+        "score": 0.5,
+        "scoreDisplayMode": "metricSavings",
+        "metricSavings": { "FCP": 0, "LCP": 0 },
+        "displayValue": "Est savings of 33 KiB",
+        "details": {
+          "type": "opportunity",
+          "items": [
+            {
+              "url": "https://qwik-guvi-perf-fix.codingpuppet.com/assets/CWW_YeKJ-pravartak.webp",
+              "totalBytes": 11042,
+              "wastedBytes": 6909,
+              "node": {
+                "type": "node",
+                "nodeLabel": "Pravartak",
+                "selector": "div.hero > img.avatar",
+                "snippet": "<img decoding=\"async\" loading=\"eager\" alt=\"Pravartak\" fetchpriority=\"high\" width=\"248\" height=\"100\">"
+              }
+            },
+            {
+              "url": "https://qwik-guvi-perf-fix.codingpuppet.com/assets/CZMV7DG5-curriculum-modules.webp",
+              "totalBytes": 8192,
+              "wastedBytes": 5000
+            }
+          ]
+        }
+      },
+
+      "unused-css-rules": {
+        "id": "unused-css-rules",
+        "title": "Reduce unused CSS",
+        "description": "Reduce unused rules from stylesheets and defer CSS not used for above-the-fold content.",
+        "score": 0,
+        "scoreDisplayMode": "metricSavings",
+        "metricSavings": { "FCP": 150, "LCP": 150 },
+        "displayValue": "Est savings of 58 KiB",
+        "details": {
+          "type": "opportunity",
+          "overallSavingsBytes": 58008,
+          "items": [
+            {
+              "url": "https://qwik-guvi-perf-fix.codingpuppet.com/assets/DgVpnMkC-style.css",
+              "totalBytes": 45870,
+              "wastedBytes": 43098,
+              "wastedPercent": 93.957
+            },
+            {
+              "url": "https://www.gstatic.com/recaptcha/releases/kemdRjWFxNjgsGdhRslyEPwU/styles__ltr.css",
+              "totalBytes": 15093,
+              "wastedBytes": 15093,
+              "wastedPercent": 100
+            }
+          ]
+        }
+      },
+
+      "lcp-breakdown-insight": {
+        "id": "lcp-breakdown-insight",
+        "title": "Breakdown of Largest Contentful Paint",
+        "description": "A breakdown of the Largest Contentful Paint.",
+        "score": 1,
+        "scoreDisplayMode": "informative",
+        "details": {
+          "type": "group",
+          "items": [
+            {
+              "type": "table",
+              "items": [
+                { "subpart": "timeToFirstByte", "label": "Time to first byte", "duration": 578.17 },
+                { "subpart": "elementRenderDelay", "label": "Element render delay", "duration": 1083.338 }
+              ]
+            },
+            {
+              "type": "node",
+              "nodeLabel": "Learn from the best, build real-world projects, and get placement-ready",
+              "selector": "div.hero > div.subhead",
+              "snippet": "<div class=\"hero-subhead text-base font-medium text-gray\">"
+            }
+          ]
+        }
+      },
+
+      "mainthread-work-breakdown": {
+        "id": "mainthread-work-breakdown",
+        "title": "Minimize main thread work",
+        "description": "Reduce the time spent parsing, compiling, and executing JavaScript.",
+        "score": 1,
+        "scoreDisplayMode": "informative",
+        "details": {
+          "items": [
+            { "group": "other", "groupLabel": "Other", "duration": 294.18 },
+            { "group": "styleLayout", "groupLabel": "Style & Layout", "duration": 164.88 }
+          ]
+        }
+      },
+
+      "third-parties-insight": {
+        "id": "third-parties-insight",
+        "title": "Reduce the impact of third-party code",
+        "description": "Third-party code can significantly impact load performance.",
+        "score": 1,
+        "scoreDisplayMode": "informative",
+        "details": {
+          "items": [
+            {
+              "entity": "Cloudflare",
+              "transferSize": 10475,
+              "mainThreadTime": 9.72,
+              "subItems": {
+                "type": "subitems",
+                "items": [
+                  {
+                    "url": "https://static.cloudflareinsights.com/beacon.min.js/v31edd6df",
+                    "transferSize": 10475,
+                    "mainThreadTime": 9.72,
+                    "resourceType": "Script"
+                  }
+                ]
+              }
+            }
+          ]
+        }
+      }
+    }
+  },
+  "loadingExperience": {
+    "metrics": { "LARGEST_CONTENTFUL_PAINT_MS": { "percentile": 75, "distributions": [] } },
+    "initial_url": "https://qwik-guvi-perf-fix.codingpuppet.com/"
+  }
+}

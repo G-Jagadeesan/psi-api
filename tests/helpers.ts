@@ -21,6 +21,31 @@ export function normalizeFixture(
   return normalizeReport(raw, FIXTURE_URL, strategy);
 }
 
+/**
+ * A Lighthouse 13 response as actually observed in production.
+ *
+ * The shipped `raw-example.com.json` is Lighthouse 10-era: its audits carry a
+ * positive `details.overallSavingsMs`. Real Lighthouse 13 insight audits instead
+ * write `overallSavingsMs: 0` and put the real cost on the detail items, and for
+ * several audits put the only estimate inside `displayValue`. Testing against the
+ * old shape is how a suite stays green while the tool reports 0ms for its
+ * largest findings.
+ */
+export const lh13Raw = JSON.parse(
+  readFileSync(path.join(here, 'fixtures', 'raw-lh13-real.json'), 'utf8'),
+) as Record<string, unknown>;
+
+export const LH13_URL = 'https://qwik-guvi-perf-fix.codingpuppet.com/';
+
+export function normalizeLh13(
+  mutate?: (raw: Record<string, unknown>) => void,
+  strategy: Strategy = 'mobile',
+): NormalizedReport {
+  const raw = JSON.parse(JSON.stringify(lh13Raw)) as Record<string, unknown>;
+  mutate?.(raw);
+  return normalizeReport(raw, LH13_URL, strategy);
+}
+
 export interface MakeReportOptions {
   score?: number;
   metrics?: Partial<Record<MetricKey, number>>;

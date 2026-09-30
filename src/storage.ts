@@ -132,3 +132,53 @@ export async function loadRuns(
 export function hostDirFor(url: string, dataDir = getDataDir()): string {
   return dataDirForHost(url, dataDir);
 }
+
+export interface StoredReportRef {
+  reportId: string;
+  host: string;
+  dir: string;
+}
+
+/**
+ * Every stored report on disk, newest first.
+ *
+ * Stored reports are snapshots of whatever the aggregation rules produced when
+ * they were written, so they go stale whenever those rules improve. Listing them
+ * is what lets a bulk re-analysis upgrade a whole history at no PSI cost.
+ */
+export async function listReports(dataDir = getDataDir()): Promise<StoredReportRef[]> {
+  let hosts: string[];
+  try {
+    hosts = (await readdir(dataDir, { withFileTypes: true }))
+      .filter((entry) => entry.isDirectory())
+      .map((entry) => entry.name);
+  } catch {
+    return [];
+  }
+
+  const found: StoredReportRef[] = [];
+  for (const host of hosts) {
+    let entries: string[];
+    try {
+      entries = (await readdir(path.join(dataDir, host), { withFileTypes: true }))
+        .filter((entry) => entry.isDirectory())
+        .map((entry) => entry.name);
+    } catch {
+      continue;
+    }
+    for (const reportId of entries) {
+      // Only count a directory that actually holds a report, so a stray folder
+      // does not become a failed re-analysis.
+      const dir = path.join(dataDir, host, reportId);
+      try {
+        await stat(path.join(dir, 'report.json'));
+      } catch {
+        continue;
+      }
+      found.push({ reportId, host, dir });
+    }
+  }
+
+  // Report ids are timestamp-prefixed, so a reverse string sort is newest first.
+  return found.sort((a, b) => b.reportId.localeCompare(a.reportId));
+}

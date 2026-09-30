@@ -2,6 +2,7 @@ import { config as loadEnv } from 'dotenv';
 import { pathToFileURL } from 'node:url';
 import { runReport, MAX_RUNS, InsufficientRunsError } from './runner.js';
 import { filterInsights } from './insights.js';
+import { diagnose as diagnoseReport, METRIC_LABELS } from './diagnose.js';
 import { loadTargets } from './targets.js';
 import { loadReport } from './storage.js';
 import { STATS, STRATEGIES, type AggregatedReport, type MetricKey, type SortField, type SortOrder } from './types.js';
@@ -11,7 +12,7 @@ import { UrlValidationError } from './psiClient.js';
 loadEnv();
 
 const FILTER_GROUPS = ['opportunity', 'diagnostic', 'passed', 'informative'] as const;
-const SORT_FIELDS = ['savingsMs', 'savingsBytes', 'score'] as const;
+const SORT_FIELDS = ['savingsMs', 'savingsBytes', 'score', 'firstPartyShare'] as const;
 const ORDERS = ['asc', 'desc'] as const;
 const PARTIES = ['any', 'first', 'third'] as const;
 
@@ -31,12 +32,15 @@ interface CliOptions {
   id?: string[];
   hasItems?: boolean;
   party: (typeof PARTIES)[number];
+  minFirstPartyRatio?: number;
   sortBy: SortField;
   order: SortOrder;
   limit?: number;
   includeFlaky: boolean;
   json: boolean;
   noSave: boolean;
+  /** Rank the work queue and print a diagnosis instead of a flat insight list. */
+  diagnose: boolean;
 }
 
 const USAGE = `
@@ -60,11 +64,18 @@ Options:
   --id <list>             Comma separated audit ids
   --hasItems              Only insights that carry a details item list
   --party <any|first|third>  Whose cost counts (default any)
-                          first = drop insights charged to other people's domains
-  --sortBy <field>        savingsMs | savingsBytes | score (default savingsMs)
+                          first = keep everything you own any part of; drops ONLY
+                           findings that are entirely somebody else's cost. A mixed
+                           finding (your CSS + a vendor stylesheet) is KEPT - you
+                           still own most of that fix.
+  --minFirstPartyRatio <n>  Keep insights whose cost is at least n yours (0-1)
+  --sortBy <field>        savingsMs | savingsBytes | score | firstPartyShare
+                           (default savingsMs)
   --order <asc|desc>      default desc (most savings first)
   --limit <n>             Max insights to print
   --noFlaky               Hide insights seen in fewer than 30% of runs
+  --diagnose              Rank the work queue against the metrics that are
+                           actually failing, and print the diagnosis
   --json                  Machine-readable JSON
   --no-save               Do not write the report to data/
   -h, --help              This message
@@ -125,6 +136,8 @@ export function parseArgs(argv: string[]): CliOptions | null {
   let maxScore: number | undefined;
   let hasItems: boolean | undefined;
   let party: (typeof PARTIES)[number] = 'any';
+  let minFirstPartyRatio: number | undefined;
+  let diagnoseFlag = false;
   let sortBy: SortField = 'savingsMs';
   let order: SortOrder = 'desc';
   let limit: number | undefined;
@@ -212,6 +225,16 @@ export function parseArgs(argv: string[]): CliOptions | null {
         i += 1;
         break;
       }
+      case '--minFirstPartyRatio': {
+        const value = toNumber(takeValue(argv, i, arg), arg);
+        if (value < 0 || value > 1) fail('--minFirstPartyRatio must be between 0 and 1');
+        minFirstPartyRatio = value;
+        i += 1;
+        break;
+      }
+      case '--diagnose':
+        diagnoseFlag = true;
+        break;
       case '--hasItems':
         hasItems = true;
         break;
@@ -275,12 +298,14 @@ export function parseArgs(argv: string[]): CliOptions | null {
     maxScore,
     hasItems,
     party,
+    minFirstPartyRatio,
     sortBy,
     order,
     limit,
     includeFlaky,
     json,
     noSave,
+    diagnose: diagnoseFlag,
   };
 }
 
@@ -309,9 +334,9 @@ function pad(value: string, width: number): string {
   return value.length >= width ? value.slice(0, width) : value.padEnd(width);
 }
 
-function renderHuman(options: CliOptions, report: Awaited<ReturnType<typeof runReport>>['report']): string {
-  const useColor = process.stdout.isTTY === true && !process.env.NO_COLOR;
-  const insights = filterInsights(report.insights, {
+/** Filters the CLI applies to a stored report. Shared by both renderers. */
+function filtersFrom(options: CliOptions): InsightFilters {
+  return {
     group: options.group,
     minSavingsMs: options.minSavingsMs,
     minSavingsBytes: options.minSavingsBytes,
@@ -321,11 +346,19 @@ function renderHuman(options: CliOptions, report: Awaited<ReturnType<typeof runR
     id: options.id,
     hasItems: options.hasItems,
     party: options.party,
+    minFirstPartyRatio: options.minFirstPartyRatio,
     sortBy: options.sortBy,
     order: options.order,
     limit: options.limit,
     includeFlaky: options.includeFlaky,
-  } satisfies InsightFilters);
+  };
+}
+
+function renderHuman(options: CliOptions, report: Awaited<ReturnType<typeof runReport>>['report']): string {
+  if (options.diagnose) return renderDiagnosis(report, options);
+
+  const useColor = process.stdout.isTTY === true && !process.env.NO_COLOR;
+  const insights = filterInsights(report.insights, filtersFrom(options));
 
   const lines: string[] = [];
 
@@ -356,23 +389,42 @@ function renderHuman(options: CliOptions, report: Awaited<ReturnType<typeof runR
     .join('  ');
   if (metricsLine) lines.push(metricsLine);
 
-  const noise = report.score.stddev;
-  lines.push(
-    color(
-      DIM,
-      `spread: score stddev ${noise.toFixed(1)} · values ${report.score.values.join(', ')}`,
-      useColor,
-    ),
-  );
+  // Tail percentiles, because a budget describes real sessions rather than the
+  // middle of the distribution. On a page whose score splits into two lanes the
+  // p75 is the number that predicts what a user actually sees.
+  const spread = `spread: score p25 ${report.score.p25} p75 ${report.score.p75} p95 ${report.score.p95} · stddev ${report.score.stddev.toFixed(1)}`;
+  lines.push(color(DIM, spread, useColor));
+  if (report.distributions?.score?.bimodal) {
+    lines.push(color(YELLOW, `  bimodal: ${report.distributions.score.note}`, useColor));
+  }
 
   const status = report.targets.meetsTarget
     ? color(GREEN, 'MEETS TARGET', useColor)
     : color(RED, 'BELOW TARGET', useColor);
   const failing = report.targets.gaps
     .filter((gap) => !gap.meets)
-    .map((gap) => `${gap.metric} ${gap.delta > 0 ? '+' : ''}${gap.delta}`)
+    .map((gap) => {
+      const delta = `${gap.delta > 0 ? '+' : ''}${gap.delta}`;
+      // Surface the pass rate next to any gap, since a median-only verdict hides
+      // runs that bust the budget.
+      const rate = gap.passRate === undefined ? '' : ` (${Math.round(gap.passRate * 100)}% of runs in budget)`;
+      return `${gap.metric} ${delta}${rate}`;
+    })
     .join(' ');
   lines.push(failing ? `${status}  ${color(DIM, failing, useColor)}` : status);
+
+  if (report.targets.medianPass && !report.targets.meetsTarget) {
+    lines.push(
+      color(
+        YELLOW,
+        '  note: every median is inside budget, but too few individual runs are. Judged on the tail.',
+        useColor,
+      ),
+    );
+  }
+  for (const reason of report.targets.blockedBy ?? []) {
+    lines.push(color(YELLOW, `  blocked: ${reason}`, useColor));
+  }
 
   lines.push('');
   lines.push(color(BOLD, `INSIGHTS (${insights.length} of ${report.insights.length})`, useColor));
@@ -393,7 +445,11 @@ function renderHuman(options: CliOptions, report: Awaited<ReturnType<typeof runR
       const items = insight.itemsTotal ?? insight.items?.length ?? 0;
       lines.push(
         `  ${pad(saving, 9)}${pad(insight.id, 42)}${pad(insight.group, 13)}${pad(affected, 9)}${items}` +
-          (insight.flaky ? color(YELLOW, ' flaky', useColor) : ''),
+          (insight.flaky ? color(YELLOW, ' flaky', useColor) : '') +
+          // Mixed findings are the ones `--party first` used to hide, so mark them.
+          (insight.firstPartyShare !== null && insight.firstPartyShare !== undefined && insight.firstPartyShare < 1
+            ? color(DIM, ` ${Math.round(insight.firstPartyShare * 100)}% first-party`, useColor)
+            : ''),
       );
     }
   }
@@ -405,6 +461,134 @@ function renderHuman(options: CliOptions, report: Awaited<ReturnType<typeof runR
     for (const failure of failed.slice(0, 3)) {
       lines.push(color(DIM, `  run ${failure.run}: ${failure.message}`, useColor));
     }
+  }
+
+  lines.push('');
+  lines.push(color(DIM, `reportId ${report.reportId}`, useColor));
+  lines.push('');
+  return lines.join('\n');
+}
+
+/**
+ * The diagnosis view: what is failing, what to do about it, and what to ignore.
+ *
+ * This exists because the flat insight table answers "what did Lighthouse find"
+ * but not "what should I work on". Ranking by raw savings optimises whatever is
+ * biggest; ranking against the metrics that actually fail optimises the page.
+ */
+function renderDiagnosis(report: AggregatedReport, options: CliOptions): string {
+  const useColor = process.stdout.isTTY === true && !process.env.NO_COLOR;
+  const diagnosis = diagnoseReport(report, {
+    filters: {
+      group: options.group ?? ['opportunity', 'diagnostic'],
+      party: options.party,
+      minFirstPartyRatio: options.minFirstPartyRatio,
+      sortBy: options.sortBy,
+      limit: options.limit,
+      includeFlaky: options.includeFlaky,
+    },
+  });
+
+  const lines: string[] = [];
+  lines.push('');
+  lines.push(`${color(BOLD, report.url, useColor)}  ${color(DIM, `[${report.strategy}]`, useColor)}`);
+  lines.push(
+    `${color(DIM, 'score', useColor)} ${scoreColor(report.headline.score, useColor)}/100  ` +
+      color(DIM, `(${report.stat} of ${report.runsSucceeded}/${report.runsRequested} runs)`, useColor),
+  );
+  lines.push(
+    color(
+      DIM,
+      `p25 ${report.score.p25} · p75 ${report.score.p75} · p95 ${report.score.p95} · ` +
+        `stddev ${report.score.stddev.toFixed(1)}`,
+      useColor,
+    ),
+  );
+
+  lines.push('');
+  lines.push(color(BOLD, 'METRICS OVER BUDGET', useColor));
+  if (diagnosis.priorityOrder.length === 0) {
+    lines.push(color(GREEN, '  every measured metric is inside its budget', useColor));
+  } else {
+    for (const gap of diagnosis.priorityOrder) {
+      const label = METRIC_LABELS[gap.metric] ?? gap.metric.toUpperCase();
+      const pct = gap.passRate === undefined ? '' : `  pass ${Math.round(gap.passRate * 100)}%`;
+      lines.push(`  ${color(RED, label, useColor)} ${gap.actual} vs ${gap.target} (${gap.delta > 0 ? '+' : ''}${gap.delta})${pct}`);
+    }
+  }
+
+  if (diagnosis.blocked.length > 0) {
+    lines.push('');
+    lines.push(color(YELLOW, 'NOT REACHABLE FROM THE FRONTEND', useColor));
+    for (const reason of diagnosis.blocked) lines.push(color(DIM, `  ${reason}`, useColor));
+  }
+
+  const lcp = report.lcp;
+  if (lcp) {
+    lines.push('');
+    lines.push(color(BOLD, 'LCP ELEMENT', useColor));
+    lines.push(
+      color(
+        DIM,
+        `  ${lcp.isText ? 'text node' : `${lcp.elementType ?? 'image'} element`}` +
+          `${lcp.text ? ` - "${lcp.text.slice(0, 60)}"` : ''}`,
+        useColor,
+      ),
+    );
+    const phaseEntries = Object.entries(lcp.phases).filter(([, v]) => typeof v === 'number') as Array<
+      [string, number]
+    >;
+    if (phaseEntries.length > 0) {
+      lines.push(
+        color(
+          DIM,
+          '  phases: ' +
+            phaseEntries
+              .sort((a, b) => b[1] - a[1])
+              .map(([key, value]) => `${key} ${Math.round(value)}ms`)
+              .join(' · '),
+          useColor,
+        ),
+      );
+    }
+    lines.push(color(DIM, `  dominant: ${lcp.bottleneck}`, useColor));
+  }
+
+  lines.push('');
+  lines.push(color(BOLD, 'WORK QUEUE', useColor));
+  if (diagnosis.ranked.length === 0) {
+    lines.push(color(DIM, '  nothing actionable against the failing metrics', useColor));
+  } else {
+    for (const entry of diagnosis.ranked) {
+      const saving = entry.insight.savingsMs !== null && entry.insight.savingsMs > 0 ? formatMs(entry.insight.savingsMs) : '-';
+      const share = entry.firstPartyShare === null ? 'unattributed' : `${Math.round(entry.firstPartyShare * 100)}%`;
+      lines.push(
+        `  ${color(DIM, `#${entry.rank}`, useColor)} ${pad(saving, 8)}${pad(entry.insight.id, 40)}${pad(share, 14)}${color(DIM, entry.reason, useColor)}`,
+      );
+      if (entry.sop) {
+        lines.push(color(DIM, `      ${entry.sop.sop}  ${entry.sop.action}`, useColor));
+      }
+      if (entry.thirdPartyOnly) {
+        lines.push(color(YELLOW, '      third-party cost - log as "not actionable in repo"', useColor));
+      }
+    }
+  }
+
+  if (diagnosis.cautions.length > 0) {
+    lines.push('');
+    lines.push(color(BOLD, 'READ THIS BEFORE TRUSTING THE NUMBERS', useColor));
+    for (const caution of diagnosis.cautions) lines.push(color(YELLOW, `  ! ${caution}`, useColor));
+  }
+
+  if (diagnosis.exhausted) {
+    lines.push('');
+    lines.push(
+      color(
+        GREEN,
+        'STOP: no first-party work remains against the failing metrics. Report and escalate.',
+        useColor,
+      ),
+    );
   }
 
   lines.push('');
@@ -468,23 +652,18 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
     }
 
     if (options.json) {
-      const insights = filterInsights(report.insights, {
-        group: options.group,
-        minSavingsMs: options.minSavingsMs,
-        minSavingsBytes: options.minSavingsBytes,
-        maxScore: options.maxScore,
-        metric: options.metric,
-        search: options.search,
-        id: options.id,
-        hasItems: options.hasItems,
-        party: options.party,
-        sortBy: options.sortBy,
-        order: options.order,
-        limit: options.limit,
-        includeFlaky: options.includeFlaky,
-      } satisfies InsightFilters);
+      const insights = filterInsights(report.insights, filtersFrom(options));
+      // The diagnosis is included because a machine consumer needs the same
+      // ranking a human gets from --diagnose, without running two commands.
+      const diagnosis = options.diagnose
+        ? diagnoseReport(report, { filters: filtersFrom(options) })
+        : undefined;
       process.stdout.write(
-        `${JSON.stringify({ ...report, matchedInsights: insights, warnings }, null, 2)}\n`,
+        `${JSON.stringify(
+          { ...report, matchedInsights: insights, ...(diagnosis ? { diagnosis } : {}), warnings },
+          null,
+          2,
+        )}\n`,
       );
     } else {
       process.stdout.write(`${renderHuman(options, report)}\n`);
