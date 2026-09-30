@@ -488,6 +488,24 @@ Loop from Step 2. Stop when `meetsTarget` is `true`, or when you hit the iterati
 
 ---
 
+## 3a. The "measured under" line
+
+Every report header carries a line like:
+
+```
+measured under moto g power (2022) · CPU index 928 (higher = slower) · en-US · performance only
+```
+
+This records the device emulation, CPU benchmark, locale and categories the run was taken with. PSI chooses these server-side — the caller cannot request a different device or throttle — so the only way to know what a stored number means is to record what the response said about it.
+
+**Why it matters.** Two reports are only comparable when they were measured under the same conditions. A score that moves with the CPU index has not improved. If you are comparing a report from before a PSI infrastructure change against one from after, check this line first.
+
+**What it does not say.** Throttling. PSI does not echo the throttle model, so the line does not name one. Inferring "Slow 4G" from the form factor would be a guess printed as a measurement.
+
+**Old reports.** Reports stored before this was recorded show `Lighthouse 13.5.0, device not recorded` or `not recorded`. They are still usable, but you cannot verify their conditions. Re-run or `--reanalyze` to get a fresh report with the full record.
+
+---
+
 ## 4. Quota
 
 **Each run costs one PSI API unit. A 10-run check costs 10.** Google gives each API key a daily cap; exceeding it returns `429` for the rest of the day.

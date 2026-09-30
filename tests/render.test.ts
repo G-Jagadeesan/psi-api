@@ -241,13 +241,17 @@ describe('metricValue', () => {
 });
 
 describe('metricDelta', () => {
-  it('says "in budget" rather than a negative delta that looks like a gain', () => {
-    expect(metricDelta('lcp', -99, true)).toBe('in budget');
+  it('says "in budget" when the median is under, whatever the pass rate says', () => {
+    // A metric can sit inside its budget on the median while too few runs hold
+    // it. Printing "-178ms over" for a metric 178ms *under* budget sends a
+    // reader to fix the wrong thing.
+    expect(metricDelta('speedIndex', -178)).toBe('in budget');
+    expect(metricDelta('tbt', -82)).toBe('in budget');
   });
 
   it('states the overshoot in the metric own unit', () => {
-    expect(metricDelta('fcp', 354.4, false)).toBe('+354ms over');
-    expect(metricDelta('cls', 0.02, false)).toBe('+0.020 over');
+    expect(metricDelta('fcp', 354.4)).toBe('+354ms over');
+    expect(metricDelta('cls', 0.02)).toBe('+0.020 over');
   });
 });
 

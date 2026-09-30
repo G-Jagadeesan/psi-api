@@ -420,11 +420,19 @@ function round1(value: number): number {
   return Math.round(value * 10) / 10;
 }
 
-/** A signed difference, or a plain "inside budget" when there is nothing to add up. */
-export function metricDelta(metric: string, delta: number, meets: boolean): string {
-  if (meets) return 'in budget';
+/**
+ * How the median sits against its budget.
+ *
+ * Deliberately keyed on the sign of `delta` and not on the pass-rate verdict:
+ * a metric can have its median inside budget while too few runs hold it, and
+ * printing "-178ms over" for a metric that is 178ms *under* its budget is the
+ * kind of error that sends a reader to fix the wrong thing. The pass-rate
+ * verdict is a separate column.
+ */
+export function metricDelta(metric: string, delta: number): string {
+  if (delta <= 0) return 'in budget';
   const rounded = metric === 'cls' ? delta.toFixed(3) : `${Math.round(delta)}ms`;
-  return `${delta > 0 ? '+' : ''}${rounded} over`;
+  return `+${rounded} over`;
 }
 
 /** Byte counts the way Lighthouse writes them: powers of 1024, no decimals. */

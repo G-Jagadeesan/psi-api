@@ -121,6 +121,29 @@ Examples:
   npm run psi -- https://example.com --group opportunity,diagnostic --maxScore 0.9
   npm run psi -- --reportId 2026-09-29T10-30-00Z-mobile --metric lcp
 
+Output:
+  The default view leads with a verdict, then a metric table where every row
+  shares one bar scale and the budget is marked on the bar. The --diagnose
+  flag ranks the work queue against the metrics that are actually failing.
+
+  https://example.com/zen-class/data-science-course/
+  mobile · Lighthouse 13.5.0 · median of 10/10 runs · 2026-09-30
+  measured under moto g power (2022) · CPU index 928 (higher = slower) · en-US · performance only
+
+  SCORE    94 / 100  target 90   p25 93 · p75 94 · p95 94.6 · range 84–95 · stddev 3.4
+
+  VERDICT  FAIL  1 of 6 budgets failing
+          FCP 2154ms vs 1800ms (0/10 runs in budget)
+
+    METRIC       MEDIAN  BUDGET  VERDICT      RUNS IN BUDGET
+    FCP          2154ms  1800ms  +354ms over            0/10  ███████┃····
+    LCP          2401ms  2500ms  in budget             10/10  ████████┃···
+
+  The "measured under" line records the device, CPU benchmark, locale and
+  categories the run was taken with. Two reports are only comparable when they
+  were measured under the same conditions, and PSI chooses those conditions
+  server-side - the caller cannot request them.
+
 Use "npm run --silent psi -- ..." for --json, so npm's banner does not
 end up in your stdout.
 `;
@@ -534,7 +557,11 @@ function budgetCells(
     const meets = gap?.meets ?? true;
     const bar = barSegments(actual, target, scale);
     const barText =
-      paint(meets ? 'green' : 'red', bar.fill + bar.lead, useColor) +
+      // The bar colours the median's position against the budget line, which is
+      // what the eye reads at a glance. Whether enough runs held it is the next
+      // column's job, and colouring the bar by that instead would make a
+      // median-passing metric look broken.
+      paint(bar.over ? 'red' : 'green', bar.fill + bar.lead, useColor) +
       paint('cyan', bar.tick, useColor) +
       paint('dim', bar.rest, useColor);
     return [
@@ -542,7 +569,7 @@ function budgetCells(
       metricValue(entry.key, actual),
       gap ? metricValue(entry.key, gap.target) : ABSENT,
       gap
-        ? paint(meets ? 'green' : 'red', metricDelta(entry.key, gap.delta, gap.meets), useColor)
+        ? paint(meets ? 'green' : 'red', metricDelta(entry.key, gap.delta), useColor)
         : ABSENT,
       gap ? paint(passPaint(gap), passCount(gap), useColor) : ABSENT,
       barText,
@@ -710,7 +737,7 @@ function renderDiagnosis(report: AggregatedReport, options: CliOptions): string 
   );
   lines.push('');
 
-  lines.push(paint('bold', 'OVER BUDGET', useColor));
+  lines.push(paint('bold', 'BUDGETS FAILING', useColor));
   if (diagnosis.priorityOrder.length === 0) {
     lines.push(paint('green', `${INDENT}every measured metric is inside its budget`, useColor));
   } else {

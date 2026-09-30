@@ -358,6 +358,22 @@ Two facts decide which playbook applies, and neither is visible in the LCP numbe
 - **`isText`** — if the LCP element is a text node there is no image to prioritise, lazy-load or resize, so `lcp-discovery-insight`, `prioritize-lcp-image-insight` and `lcp-lazy-loaded-insight` do not apply. On a real deployment of this project the LCP element is a `<div>` of body copy, and `lcp-discovery-insight` is `notApplicable`. There is deliberately no load phase in that case, because there is no resource to load — the absence is the finding.
 - **`bottleneck`** — `loadDelay`/`loadTime` means fetch earlier; `renderDelay` means something is blocking paint, usually CSS; `ttfb` means the server is the constraint and no component change will help.
 
+### The "measured under" line
+
+Every report header carries a line recording the conditions the run was taken under:
+
+```
+measured under moto g power (2022) · CPU index 928 (higher = slower) · en-US · performance only
+```
+
+PSI chooses the device, throttle and CPU server-side — the caller cannot request them — so the only way to know what a stored number means is to record what the response said about it. The line captures the device (parsed from the network user agent), the CPU benchmark index, locale and categories.
+
+Two reports are only comparable when measured under the same conditions. A score that moves with the CPU index has not improved.
+
+Throttling is deliberately absent: PSI does not echo it, and inferring "Slow 4G" from the form factor would be a guess printed as a measurement.
+
+Reports stored before this was recorded show `Lighthouse 13.5.0, device not recorded` or `not recorded`. They are still usable, but their conditions cannot be verified.
+
 ### PSI caches per URL
 
 **The single most important thing to know about multi-run measurement.** PSI caches results per URL: asking for the same URL twice in a row returns *one* Lighthouse run, not two. Measured directly against the live API — five back-to-back calls returned one identical `analysisUTCTimestamp`.
