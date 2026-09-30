@@ -42,6 +42,24 @@ const MIN_LANE_SHARE = 0.2;
 const MIN_SEPARATION = 4;
 
 /**
+ * Gap between the two lane means before the split is worth *explaining*.
+ *
+ * Separate from `MIN_SEPARATION`, which decides whether a split exists at all.
+ * That threshold is statistical and has to stay low: the reader may want to
+ * inspect the lanes even when they are close together. This one is editorial -
+ * it decides whether the report interrupts the reader about them - so it is set
+ * at the point where two lanes describe two visibly different user experiences
+ * rather than ordinary run-to-run variation on a 0-100 score.
+ *
+ * Six points is the calibration: below it, Lighthouse's own scoring bands put
+ * both lanes in the same "needs improvement" region and a reader who is told to
+ * "compare lane-to-lane" learns to skip the line. Measured against the observed
+ * reports, a lane split of 1.1 points is pure noise and 6.25 is the real
+ * boundary case.
+ */
+export const MIN_NOTE_GAP = 6;
+
+/**
  * Bucket width per metric for the `mode` statistic. Continuous values have to be
  * bucketed before "most frequent" means anything.
  */
@@ -223,13 +241,18 @@ export function detectDistribution(values: number[]): Distribution {
       ? lanesArray
       : [...lanesArray].reverse();
     // The note is the *actionable* half of the claim, and it is gated separately
-    // from `bimodal`. Two lanes six points apart on a 0-100 score are a real
+    // from `bimodal`. Two lanes a point apart on a 0-100 score are a real
     // statistical split but not a difference anyone should act on, and printing
     // "the median sits in one lane by run count" about a 1-point spread trains
     // the reader to ignore the line. Left undefined rather than set to an empty
     // string, so a caller testing for a note sees the same thing either way.
-    const distance = fast != null && slow != null ? round(fast.value - slow.value, 0) : 0;
-    if (distance > 10) {
+    //
+    // Compared on the raw lane means, not on their rounded display values.
+    // Rounding first would put the threshold on a step function of its own - a
+    // real gap of 6.4 would be suppressed while 6.6 was reported - so the gate
+    // would quietly disagree with the measurement it is gating.
+    const distance = fast != null && slow != null ? fast.value - slow.value : 0;
+    if (distance > MIN_NOTE_GAP) {
       result.note =
         `Bimodal: ${pct(slow?.share ?? 0)} of runs at ~${round(slow?.value ?? 0, 0)} and ` +
         `${pct(fast?.share ?? 0)} at ~${round(fast?.value ?? 0, 0)}. The median sits in one lane ` +

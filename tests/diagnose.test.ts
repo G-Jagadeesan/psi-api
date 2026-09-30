@@ -193,10 +193,10 @@ describe('cautions', () => {
   });
 
   it('stays quiet about a bimodal score whose lanes are too close to act on', () => {
-    // Two lanes ~6 apart on a 0-100 scale. Statistically a split, but telling
-    // the reader to "compare lane-to-lane" about a 6-point gap trains them to
-    // ignore every line this section emits.
-    const scores = [88, 87.5, 88.5, 88, 93.5, 94, 95.5, 93, 94.5, 95];
+    // Two lanes ~4 points apart on a 0-100 scale - under `MIN_NOTE_GAP`.
+    // Statistically a split, but telling the reader to "compare lane-to-lane"
+    // about a 4-point gap trains them to ignore every line this section emits.
+    const scores = [88, 87.5, 88.5, 88, 92, 92.5, 93, 91.5, 92.2, 92.8];
     const runs = scores.map((s, i) => {
       const run = normalizeLh13();
       run.fetchTime = `2026-09-30T03-4${i}-00Z`;

@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { aggregateReports, detectDistribution, percentile, seriesStats } from '../src/aggregate.js';
+import { aggregateReports, detectDistribution, MIN_NOTE_GAP, percentile, seriesStats } from '../src/aggregate.js';
 import { normalizeLh13, LH13_URL } from './helpers.js';
 import type { NormalizedReport, Strategy } from '../src/types.js';
 
@@ -57,23 +57,39 @@ describe('detectDistribution', () => {
     expect(dist.separation).toBeGreaterThan(2);
   });
 
-  it('explains the split only when the two modes are more than 10 apart', () => {
-    // The lanes here sit around 88 and 94 - a real 6-point cliff on a 0-100
-    // scale, but not far enough to be worth a paragraph. The statistical claim
-    // and the actionable one are separate gates on purpose: `bimodal` is true,
-    // and the report stays quiet about it.
-    const close = detectDistribution([88, 88, 88.5, 87.5, 94, 95, 93.5, 94.5, 95.5, 93]);
-    expect(close.bimodal).toBe(true);
-    // Undefined rather than empty: a caller testing for a note must not have to
-    // handle both "no note" and "a note that happens to be blank".
-    expect(close.note).toBeUndefined();
+  it('explains the split only when the two modes are more than 6 apart', () => {
+    // A 1.1-point split is pure noise, and telling the reader to compare
+    // lane-to-lane about it trains them to skip the line entirely.
+    const noise = detectDistribution([94, 94, 94.5, 93.5, 95, 95.5, 94.8, 95.2, 95.1, 94.2]);
+    expect(noise.note).toBeUndefined();
 
-    // A genuine 30-point split is worth explaining.
+    // Exactly 6 is not "more than 6", so it stays quiet.
+    const atThreshold = detectDistribution([88, 88, 88, 88, 94, 94, 94, 94, 94, 94]);
+    expect(atThreshold.bimodal).toBe(true);
+    expect(atThreshold.note).toBeUndefined();
+
+    // 7 clears it.
+    const justOver = detectDistribution([88, 88, 88, 88, 95, 95, 95, 95, 95, 95]);
+    expect(justOver.bimodal).toBe(true);
+    expect(justOver.note).toMatch(/Bimodal/);
+
+    // A genuine 30-point split is unambiguously worth explaining.
     const wide = detectDistribution([60, 61, 60.5, 59.5, 90, 91, 89.5, 90.5, 91.5, 89]);
     expect(wide.bimodal).toBe(true);
     expect(wide.note).toMatch(/Bimodal/);
     expect(wide.note).toMatch(/~60/);
     expect(wide.note).toMatch(/~90/);
+  });
+
+  it('gates on the raw lane gap, not the rounded one shown to the reader', () => {
+    // These lanes read as "~88" and "~94" - a gap of 6, and so the boundary -
+    // but the actual means are 6.25 apart. Comparing the rounded display values
+    // would put the threshold on a step function of its own, and a real gap of
+    // 6.4 would be suppressed while 6.6 was reported.
+    const dist = detectDistribution([88, 88, 88.5, 87.5, 94, 95, 93.5, 94.5, 95.5, 93]);
+    const means = dist.lanes.map((lane) => lane.value);
+    expect(means[1]! - means[0]!).toBeGreaterThan(MIN_NOTE_GAP);
+    expect(dist.note).toBeDefined();
   });
 
   it('stays quiet on ordinary run-to-run jitter', () => {
