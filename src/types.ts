@@ -131,6 +131,71 @@ export interface RunEnvironment {
    * A report is not a full Lighthouse run unless this is everything you expected.
    */
   categories?: string[];
+  /** The emulated screen, from `configSettings.screenEmulation`. */
+  screen?: ScreenEmulation;
+}
+
+/**
+ * The viewport a run was rendered in.
+ *
+ * Needed to judge an element's position ("below the first fold") and an image's
+ * size ("larger than it renders"), both of which are in CSS pixels while the
+ * image a phone needs is in device pixels.
+ */
+export interface ScreenEmulation {
+  width: number;
+  height: number;
+  deviceScaleFactor: number;
+  /** `reported` when read from the response, `default` when Lighthouse's defaults were assumed. */
+  source: 'reported' | 'default';
+}
+
+/**
+ * One row of Lighthouse's `network-requests` table.
+ *
+ * Times are observed on PSI's own connection, relative to the first request.
+ * The order is meaningful; the absolute values are not comparable to FCP/LCP,
+ * which PSI computes by simulating a throttled connection.
+ */
+export interface NetworkRequest {
+  url: string;
+  resourceType?: string;
+  mimeType?: string;
+  priority?: string;
+  startMs?: number;
+  endMs?: number;
+  transferSize?: number;
+  resourceSize?: number;
+  statusCode?: number;
+  isLinkPreload?: boolean;
+  entity?: string;
+  party: 'first' | 'third';
+}
+
+export type ImageFindingKind =
+  | 'oversized'
+  | 'compression'
+  | 'srcsetWithoutSizes'
+  | 'eagerOffscreen'
+  | 'lazyInFirstFold'
+  | 'heavyImage'
+  | 'multipleHighPriority';
+
+export interface ImageFinding {
+  kind: ImageFindingKind;
+  url?: string;
+  selector?: string;
+  /** One sentence saying what is wrong and what the fix is. */
+  detail: string;
+  /** Bytes the finding costs or could save, when known. */
+  bytes?: number;
+  /** For `oversized`: true when the waste survives the device-pixel correction. */
+  real?: boolean;
+}
+
+export interface ImageChecks {
+  screen: ScreenEmulation;
+  findings: ImageFinding[];
 }
 
 export interface NormalizedReport {
@@ -145,6 +210,8 @@ export interface NormalizedReport {
   metrics: Metrics;
   insights: Insight[];
   fieldData: FieldData | null;
+  /** Absent on runs stored before the request table was kept. */
+  requests?: NetworkRequest[];
 }
 
 /** A distribution of one measured value across the successful runs. */
@@ -307,6 +374,16 @@ export interface AggregatedReport {
   distributions: Partial<Record<'score' | MetricKey, Distribution>>;
   /** What the LCP element actually is, and where its time went. */
   lcp: LcpDetail | null;
+  /**
+   * Every request the median run made, or null when the runs carry none.
+   * Absent on reports stored before the request table was kept.
+   */
+  requests?: NetworkRequest[] | null;
+  /**
+   * Image problems worked out from the median run's element and request data.
+   * Absent on reports stored before image checks existed; `--reanalyze` adds it.
+   */
+  images?: ImageChecks;
   /** Same aggregate recomputed with each stat, for easy comparison. */
   stats: Record<Stat, { score: number; metrics: Metrics }>;
   insights: AggregatedInsight[];

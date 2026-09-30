@@ -7,7 +7,9 @@ import { loadTargets } from './targets.js';
 import { loadReport, loadRuns, listReports, getDataDir, saveReport } from './storage.js';
 import { diffReanalyzed, reanalyze, type ReanalyzeDelta } from './reanalyze.js';
 import { STATS, STRATEGIES, type AggregatedReport, type MetricKey, type SortField, type SortOrder } from './types.js';
-import type { FilterGroup, Gap, InsightFilters } from './types.js';
+import type { FilterGroup, Gap, ImageFinding, InsightFilters } from './types.js';
+import { imagesOf } from './images.js';
+import { renderInsightRows, renderRequests } from './rows.js';
 import { UrlValidationError } from './psiClient.js';
 import {
   ABSENT,
@@ -75,6 +77,10 @@ interface CliOptions {
   noSave: boolean;
   /** Rank the work queue and print a diagnosis instead of a flat insight list. */
   diagnose: boolean;
+  /** Print every row of these insights instead of the findings table. */
+  items?: string[];
+  /** Print the median run's request table, in this order. */
+  requests?: 'start' | 'size';
 }
 
 const USAGE = `
@@ -109,7 +115,14 @@ Options:
   --limit <n>             Max insights to print
   --noFlaky               Hide insights seen in fewer than 30% of runs
   --diagnose              Rank the work queue against the metrics that are
-                           actually failing, and print the diagnosis
+                           actually failing, and print the diagnosis, the LCP
+                           element and the image checks
+  --items <list>          Print every row of these insights (comma separated
+                           ids): URLs, elements and where they sit against the
+                           fold, snippets, sub-rows, request chains
+  --requests [start|size] Print every request the median run made, in start
+                           order (default) or largest first. Honours --party
+                           and --limit
   --reanalyze             Rebuild a stored report from its stored runs using
                            today's aggregation and target rules. Costs no PSI
                            quota. Combine with --reportId for one report, or
@@ -122,6 +135,8 @@ Examples:
   npm run psi -- https://example.com --runs 10
   npm run psi -- https://example.com --group opportunity,diagnostic --maxScore 0.9
   npm run psi -- --reportId 2026-09-29T10-30-00Z-mobile --metric lcp
+  npm run psi -- --reportId 2026-09-29T10-30-00Z-mobile --items image-delivery-insight
+  npm run psi -- --reportId 2026-09-29T10-30-00Z-mobile --requests size --limit 20
 
 Output:
   The default view leads with a verdict, then a metric table where every row
@@ -200,6 +215,8 @@ export function parseArgs(argv: string[]): CliOptions | null {
   let minFirstPartyRatio: number | undefined;
   let diagnoseFlag = false;
   let reanalyzeFlag = false;
+  let items: string[] | undefined;
+  let requests: 'start' | 'size' | undefined;
   let sortBy: SortField = 'savingsMs';
   let order: SortOrder = 'desc';
   let limit: number | undefined;
@@ -297,6 +314,25 @@ export function parseArgs(argv: string[]): CliOptions | null {
       case '--diagnose':
         diagnoseFlag = true;
         break;
+      case '--items':
+        items = takeValue(argv, i, arg)
+          .split(',')
+          .map((part) => part.trim())
+          .filter(Boolean);
+        i += 1;
+        break;
+      case '--requests': {
+        // The order is optional, so only the two exact words are taken as its
+        // value; anything else (a url, another flag) is left for the next pass.
+        const next = argv[i + 1];
+        if (next === 'start' || next === 'size') {
+          requests = next;
+          i += 1;
+        } else {
+          requests = 'start';
+        }
+        break;
+      }
       case '--reanalyze':
         reanalyzeFlag = true;
         break;
@@ -374,6 +410,8 @@ export function parseArgs(argv: string[]): CliOptions | null {
     noSave,
     diagnose: diagnoseFlag,
     reanalyze: reanalyzeFlag,
+    items,
+    requests,
   };
 }
 
@@ -620,7 +658,101 @@ function insightRow(insight: AggregatedReport['insights'][number], useColor: boo
   ];
 }
 
+/**
+ * The rows behind named findings, and the request table: the evidence a fix is
+ * written from, rather than the summary it is chosen from.
+ */
+function renderEvidence(report: AggregatedReport, options: CliOptions): string {
+  const useColor = colorEnabled();
+  const width = termWidth();
+  const lines: string[] = ['', ...header(report, useColor)];
+
+  for (const id of options.items ?? []) {
+    lines.push('');
+    const insight = report.insights.find((entry) => entry.id === id);
+    if (!insight) {
+      const near = report.insights
+        .map((entry) => entry.id)
+        .filter((candidate) => candidate.includes(id.replace(/-insight$/, '')) || id.includes(candidate))
+        .slice(0, 5);
+      lines.push(
+        paint('yellow', `${id}: not in this report`, useColor) +
+          paint('dim', near.length > 0 ? `  (did you mean ${near.join(', ')}?)` : '', useColor),
+      );
+      continue;
+    }
+    lines.push(
+      ...renderInsightRows(insight, {
+        width,
+        useColor,
+        screen: report.environment.screen ?? imagesOf(report).screen,
+        limit: options.limit,
+      }),
+    );
+  }
+
+  if (options.requests) {
+    lines.push('');
+    lines.push(
+      ...renderRequests(report.requests, {
+        width: width - INDENT.length,
+        useColor,
+        party: options.party,
+        sortBy: options.requests,
+        limit: options.limit,
+      }),
+    );
+  }
+
+  lines.push('');
+  lines.push(paint('dim', `reportId ${report.reportId}`, useColor));
+  lines.push('');
+  return lines.join('\n');
+}
+
+const IMAGE_KIND_LABELS: Record<ImageFinding['kind'], string> = {
+  oversized: 'oversized',
+  heavyImage: 'heavy',
+  srcsetWithoutSizes: 'no sizes',
+  eagerOffscreen: 'eager offscreen',
+  lazyInFirstFold: 'lazy in fold',
+  multipleHighPriority: 'priority',
+  compression: 'format',
+};
+
+/** The image checks, with the ones the pixel-density correction clears kept visibly apart. */
+function imageSection(report: AggregatedReport, useColor: boolean): string[] {
+  const { screen, findings } = imagesOf(report);
+  const assumed = screen.source === 'default' ? ', assumed' : '';
+  const lines = [
+    paint('bold', 'IMAGE CHECKS', useColor) +
+      paint('dim', `  screen ${screen.width}×${screen.height} @ ${screen.deviceScaleFactor}x${assumed}`, useColor),
+  ];
+  if (findings.length === 0) {
+    lines.push(paint('green', `${INDENT}nothing to fix in the images this run could see`, useColor));
+    return lines;
+  }
+  const body = termWidth() - INDENT.length - 4;
+  for (const finding of findings.slice(0, 15)) {
+    const clear = finding.kind === 'oversized' && finding.real === false;
+    const label = IMAGE_KIND_LABELS[finding.kind];
+    const where = finding.url ? shortenUrl(finding.url, body - label.length - 12) : (finding.selector ?? '');
+    const size = finding.bytes ? `  ${formatBytes(finding.bytes)}` : '';
+    lines.push(
+      `${INDENT}${paint(clear ? 'green' : 'yellow', clear ? 'fine' : label, useColor)}${paint('dim', size, useColor)}  ${where}`,
+    );
+    for (const line of wrap(finding.detail, body, '')) {
+      lines.push(paint('dim', `${INDENT}    ${line}`, useColor));
+    }
+  }
+  if (findings.length > 15) {
+    lines.push(paint('dim', `${INDENT}${findings.length - 15} more in --json under images.findings`, useColor));
+  }
+  return lines;
+}
+
 function renderHuman(options: CliOptions, report: Awaited<ReturnType<typeof runReport>>['report']): string {
+  if (options.items || options.requests) return renderEvidence(report, options);
   if (options.diagnose) return renderDiagnosis(report, options);
 
   const useColor = colorEnabled();
@@ -767,11 +899,17 @@ function renderDiagnosis(report: AggregatedReport, options: CliOptions): string 
   if (lcp) {
     lines.push('');
     lines.push(paint('bold', 'LCP ELEMENT', useColor));
+    const kind = lcp.isText ? 'text' : 'image';
     lines.push(
-      paint('dim', `${INDENT}${lcp.isText ? 'text node' : `${lcp.elementType ?? 'image'} element`}`, useColor),
+      paint('dim', `${INDENT}${kind} · <${(lcp.elementType ?? '?').toLowerCase()}>`, useColor) +
+        (lcp.selector ? paint('dim', `  ${truncate(lcp.selector, termWidth() - 24)}`, useColor) : ''),
     );
     if (lcp.text) {
-      lines.push(paint('dim', `${INDENT}"${truncate(lcp.text, termWidth() - INDENT.length * 2 - 2)}"`, useColor));
+      // For an image, Lighthouse's label is the alt text, not visible text.
+      const label = lcp.isText ? '' : 'alt ';
+      lines.push(
+        paint('dim', `${INDENT}${label}"${truncate(lcp.text, termWidth() - INDENT.length * 2 - 6)}"`, useColor),
+      );
     }
     // Phases in timeline order, not sorted by size: the point is "how much of
     // the wait happened before we could even start", and reordering by size
@@ -794,6 +932,9 @@ function renderDiagnosis(report: AggregatedReport, options: CliOptions): string 
       );
     }
   }
+
+  lines.push('');
+  lines.push(...imageSection(report, useColor));
 
   lines.push('');
   lines.push(paint('bold', 'WORK QUEUE', useColor));
@@ -1085,7 +1226,11 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
     }
 
     if (options.json) {
-      const insights = filterInsights(report.insights, filtersFrom(options));
+      const filters = filtersFrom(options);
+      // --items names insights to open; in JSON that is an id filter, since
+      // every matched insight already carries its rows.
+      if (options.items) filters.id = [...(filters.id ?? []), ...options.items];
+      const insights = filterInsights(report.insights, filters);
       // The diagnosis is included because a machine consumer needs the same
       // ranking a human gets from --diagnose, without running two commands.
       const diagnosis = options.diagnose
@@ -1093,7 +1238,13 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
         : undefined;
       process.stdout.write(
         `${JSON.stringify(
-          { ...report, matchedInsights: insights, ...(diagnosis ? { diagnosis } : {}), warnings },
+          {
+            ...report,
+            images: imagesOf(report),
+            matchedInsights: insights,
+            ...(diagnosis ? { diagnosis } : {}),
+            warnings,
+          },
           null,
           2,
         )}\n`,

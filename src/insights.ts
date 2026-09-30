@@ -8,9 +8,11 @@ import type {
   LcpPhases,
   MetricKey,
   Metrics,
+  NetworkRequest,
   NormalizedReport,
   RunEnvironment,
   SavingsSource,
+  ScreenEmulation,
   SortOrder,
   Strategy,
 } from './types.js';
@@ -463,9 +465,44 @@ export function baseHostOf(url: string): string {
   return host.replace(/^www\./, '');
 }
 
-function isFirstPartyHost(host: string, baseHost: string): boolean {
-  if (!baseHost) return false;
-  return host === baseHost || host.endsWith(`.${baseHost}`);
+/**
+ * Other domains the measured site owns, from `PSI_FIRST_PARTY_HOSTS`.
+ *
+ * Ownership is otherwise judged against the measured host alone, which files a
+ * site's own CDN on a sister domain (`static.guvi.in` behind `www.guvi.co`) as
+ * someone else's cost - and a third-party finding is one the queue tells the
+ * agent to log rather than fix.
+ */
+export function firstPartyHostsFromEnv(value = process.env.PSI_FIRST_PARTY_HOSTS): string[] {
+  if (!value) return [];
+  return value
+    .split(',')
+    .map((entry) =>
+      entry
+        .trim()
+        .toLowerCase()
+        .replace(/^https?:\/\//, '')
+        .replace(/\/.*$/, '')
+        .replace(/^\*\./, '')
+        .replace(/^www\./, ''),
+    )
+    .filter(Boolean);
+}
+
+function isFirstPartyHost(host: string, baseHost: string, extra: readonly string[] = []): boolean {
+  const within = (domain: string): boolean => host === domain || host.endsWith(`.${domain}`);
+  return (baseHost !== '' && within(baseHost)) || extra.some(within);
+}
+
+/** Whether a resource URL belongs to the measured site or a domain it owns. */
+export function isOwnUrl(
+  url: string,
+  measuredUrl: string,
+  extra: readonly string[] = firstPartyHostsFromEnv(),
+): boolean {
+  const host = hostOf(url);
+  if (!host) return false;
+  return isFirstPartyHost(host, baseHostOf(measuredUrl), extra);
 }
 
 /** Collect every resource URL an item refers to, including nested sub-items. */
@@ -582,27 +619,71 @@ function enrichItemsWithElements(items: unknown[], elementMap: Map<string, { nod
 }
 
 /**
- * `third-parties-insight` exists precisely to list other people's code, so every
- * row is third party by definition - even though its rows carry an `entity` name
- * rather than a top-level URL.
+ * `third-parties-insight` lists every entity other than the measured host, one
+ * row per entity with its resources under `subItems`.
+ *
+ * A row is third party unless every resource in it sits on a domain the site
+ * owns (`PSI_FIRST_PARTY_HOSTS`) - an entity is one organisation, so a partly
+ * owned row is still someone else's. Without configured hosts every row is third
+ * party, which is what Lighthouse means by the audit.
  */
-function thirdPartyByDefinition(items: unknown[]): PartyBreakdown {
+function thirdPartiesBreakdown(
+  items: unknown[],
+  baseHost: string,
+  extra: readonly string[] = [],
+): PartyBreakdown {
   const hosts = new Set<string>();
-  let attributed = 0;
+  let firstPartyItems = 0;
+  let thirdPartyItems = 0;
   for (const item of items) {
-    for (const url of itemUrls(item)) {
-      const host = hostOf(url);
-      if (host) {
-        hosts.add(host);
-        attributed += 1;
-      }
-    }
+    const rowHosts = itemUrls(item)
+      .map((url) => hostOf(url))
+      .filter((host): host is string => host !== null);
+    for (const host of rowHosts) hosts.add(host);
+    const own = rowHosts.length > 0 && rowHosts.every((host) => isFirstPartyHost(host, baseHost, extra));
+    if (own) firstPartyItems += 1;
+    else thirdPartyItems += 1;
   }
   return {
-    firstPartyItems: 0,
-    thirdPartyItems: items.length,
+    firstPartyItems,
+    thirdPartyItems,
     itemHosts: [...hosts].slice(0, MAX_REPORTED_HOSTS).sort(),
   };
+}
+
+function partyBreakdownFor(
+  id: string,
+  items: unknown[],
+  baseHost: string,
+  extra: readonly string[],
+): PartyBreakdown {
+  return id === 'third-parties-insight'
+    ? thirdPartiesBreakdown(items, baseHost, extra)
+    : classifyItemParties(items, baseHost, extra);
+}
+
+function shareOf(party: PartyBreakdown): FirstPartyShare {
+  const attributed = party.firstPartyItems + party.thirdPartyItems;
+  return attributed === 0 ? null : party.firstPartyItems / attributed;
+}
+
+/**
+ * Re-judge a stored insight's ownership, for `--reanalyze`.
+ *
+ * Only when the stored rows are complete: the counts written at normalize time
+ * were taken over every row, and recounting a trimmed top-25 would replace an
+ * exact figure with a sample of it.
+ */
+export function reclassifyInsightParties(
+  insight: Insight,
+  measuredUrl: string,
+  extra: readonly string[] = firstPartyHostsFromEnv(),
+): Insight {
+  const items = insight.items;
+  if (!items || items.length === 0) return insight;
+  if ((insight.itemsTotal ?? items.length) > items.length) return insight;
+  const party = partyBreakdownFor(insight.id, items, baseHostOf(measuredUrl), extra);
+  return { ...insight, ...party, firstPartyShare: shareOf(party) };
 }
 
 /** Remove the cache-busting param from every URL anywhere inside an item. */
@@ -637,7 +718,11 @@ const MAX_REPORTED_HOSTS = 8;
  * breakdowns, LCP phase breakdowns) count as neither, because their cost is
  * unattributed and may well be first-party code.
  */
-export function classifyItemParties(items: unknown[], baseHost: string): PartyBreakdown {
+export function classifyItemParties(
+  items: unknown[],
+  baseHost: string,
+  extra: readonly string[] = [],
+): PartyBreakdown {
   const hosts = new Set<string>();
   let firstPartyItems = 0;
   let thirdPartyItems = 0;
@@ -653,7 +738,7 @@ export function classifyItemParties(items: unknown[], baseHost: string): PartyBr
     let own = false;
     for (const host of itemHosts) {
       hosts.add(host);
-      if (isFirstPartyHost(host, baseHost)) own = true;
+      if (isFirstPartyHost(host, baseHost, extra)) own = true;
     }
     // An item is third-party if every host it loads is foreign. Mixed items
     // (your CDN plus a vendor) still count as first-party, since you own part
@@ -701,11 +786,18 @@ export function extractFieldData(raw: RawPsiResponse): FieldData | null {
  * The audit list is derived entirely from the response, so new Lighthouse
  * versions are picked up without a code change.
  */
+export interface NormalizeOptions {
+  /** Other domains the site owns. Defaults to `PSI_FIRST_PARTY_HOSTS`. */
+  firstPartyHosts?: readonly string[];
+}
+
 export function normalizeReport(
   raw: unknown,
   requestedUrl: string,
   strategy: Strategy = 'mobile',
+  options: NormalizeOptions = {},
 ): NormalizedReport {
+  const firstPartyHosts = options.firstPartyHosts ?? firstPartyHostsFromEnv();
   const body = (raw ?? {}) as RawPsiResponse;
   const result = body.lighthouseResult;
   if (!result || typeof result !== 'object') {
@@ -760,9 +852,7 @@ export function normalizeReport(
     const rawItems = detailItemsOf(details);
     // Classify across every row, not the trimmed 25, so firstPartyItems and
     // thirdPartyItems are honest counts rather than a sample.
-    const party = audit.id === 'third-parties-insight'
-      ? thirdPartyByDefinition(rawItems)
-      : classifyItemParties(rawItems, baseHostOf(measuredUrl));
+    const party = partyBreakdownFor(id, rawItems, baseHostOf(measuredUrl), firstPartyHosts);
 
     const insight: Insight = {
       id,
@@ -783,8 +873,7 @@ export function normalizeReport(
 
     // Captured here so `--sortBy firstPartyShare` and `--minFirstPartyRatio`
     // never have to re-derive it, and so the stored report explains itself.
-    const attributedTotal = party.firstPartyItems + party.thirdPartyItems;
-    insight.firstPartyShare = attributedTotal === 0 ? null : party.firstPartyItems / attributedTotal;
+    insight.firstPartyShare = shareOf(party);
 
     const numericValue = asNumber(audit.numericValue);
     if (numericValue !== undefined) insight.numericValue = numericValue;
@@ -814,7 +903,7 @@ export function normalizeReport(
     }
   }
 
-  return {
+  const normalized: NormalizedReport = {
     url: requestedUrl,
     finalUrl,
     strategy,
@@ -828,6 +917,65 @@ export function normalizeReport(
     insights,
     fieldData: extractFieldData(body),
   };
+  const requests = extractRequests(audits, measuredUrl, firstPartyHosts);
+  if (requests) normalized.requests = requests;
+  return normalized;
+}
+
+/** A page with more requests than this is summarised by its first ones. */
+const MAX_REQUESTS = 300;
+const MAX_REQUEST_URL = 300;
+
+/**
+ * Lighthouse's `network-requests` table, compacted.
+ *
+ * It is a hidden audit, so it never becomes an insight, but it is the only
+ * complete record of what the page fetched: Lighthouse 13 has no offscreen-image
+ * audit, and every other insight lists only the rows it has an opinion about.
+ */
+function extractRequests(
+  audits: Record<string, RawAudit>,
+  measuredUrl: string,
+  extra: readonly string[],
+): NetworkRequest[] | undefined {
+  const rows = detailItemsOf(audits['network-requests']?.details);
+  if (rows.length === 0) return undefined;
+  const baseHost = baseHostOf(measuredUrl);
+  const time = (value: unknown): number | undefined => {
+    const n = asNumber(value);
+    return n === undefined ? undefined : Math.round(n * 10) / 10;
+  };
+
+  return rows.slice(0, MAX_REQUESTS).map((row) => {
+    const record = (row ?? {}) as Record<string, unknown>;
+    const url = asString(record.url);
+    const host = hostOf(url);
+    const request: NetworkRequest = {
+      url: url.length > MAX_REQUEST_URL ? `${url.slice(0, MAX_REQUEST_URL)}…` : url,
+      // `data:` and `blob:` URLs have no host and are part of the page itself.
+      party: host && !isFirstPartyHost(host, baseHost, extra) ? 'third' : 'first',
+    };
+    const resourceType = asString(record.resourceType);
+    if (resourceType) request.resourceType = resourceType;
+    const mimeType = asString(record.mimeType);
+    if (mimeType) request.mimeType = mimeType;
+    const priority = asString(record.priority);
+    if (priority) request.priority = priority;
+    const startMs = time(record.networkRequestTime ?? record.startTime);
+    if (startMs !== undefined) request.startMs = startMs;
+    const endMs = time(record.networkEndTime ?? record.endTime);
+    if (endMs !== undefined) request.endMs = endMs;
+    const transferSize = asNumber(record.transferSize);
+    if (transferSize !== undefined) request.transferSize = transferSize;
+    const resourceSize = asNumber(record.resourceSize);
+    if (resourceSize !== undefined) request.resourceSize = resourceSize;
+    const statusCode = asNumber(record.statusCode);
+    if (statusCode !== undefined) request.statusCode = statusCode;
+    if (typeof record.isLinkPreload === 'boolean') request.isLinkPreload = record.isLinkPreload;
+    const entity = asString(record.entity);
+    if (entity) request.entity = entity;
+    return request;
+  });
 }
 
 /* ----------------------------- measurement environment ---------------------------- */
@@ -871,7 +1019,27 @@ function extractEnvironment(result: NonNullable<RawPsiResponse['lighthouseResult
     ...(asString(settings.channel) ? { channel: asString(settings.channel) } : {}),
     ...(asString(settings.locale) ? { locale: asString(settings.locale) } : {}),
     ...(categories && categories.length > 0 ? { categories } : {}),
+    ...screenFrom(settings.screenEmulation),
   };
+}
+
+function screenFrom(value: unknown): { screen?: ScreenEmulation } {
+  const raw = (value ?? {}) as Record<string, unknown>;
+  const width = asNumber(raw.width);
+  const height = asNumber(raw.height);
+  const deviceScaleFactor = asNumber(raw.deviceScaleFactor);
+  if (raw.disabled === true || !width || !height || !deviceScaleFactor) return {};
+  return { screen: { width, height, deviceScaleFactor, source: 'reported' } };
+}
+
+/**
+ * Lighthouse's default emulated screens, used when a response does not echo
+ * `screenEmulation`. Mobile is a moto g power (2022); desktop is unscaled.
+ */
+export function defaultScreen(strategy: Strategy): ScreenEmulation {
+  return strategy === 'desktop'
+    ? { width: 1350, height: 940, deviceScaleFactor: 1, source: 'default' }
+    : { width: 412, height: 823, deviceScaleFactor: 1.75, source: 'default' };
 }
 
 /* ------------------------------ LCP element detail ---------------------------- */
@@ -884,6 +1052,7 @@ const LCP_PHASE_KEYS: Record<string, keyof LcpPhases> = {
   resourceLoadDelay: 'loadDelay',
   loadTime: 'loadTime',
   resourceLoadTime: 'loadTime',
+  resourceLoadDuration: 'loadTime',
   elementRenderDelay: 'renderDelay',
   renderDelay: 'renderDelay',
 };
@@ -939,9 +1108,30 @@ function nodeOf(items: unknown[]): Record<string, unknown> | undefined {
 /** Image-ish element tags. Everything else as an LCP element is text. */
 const IMAGE_TAGS = new Set(['IMG', 'PICTURE', 'VIDEO', 'SVG', 'IMAGE', 'CANVAS', 'IFRAME']);
 
-function isTextElement(type: string | undefined): boolean {
-  if (!type) return true;
-  return !IMAGE_TAGS.has(type.toUpperCase());
+/**
+ * The tag of a Lighthouse node, upper-cased: from the snippet, else the DOM path
+ * (`…,PICTURE,1,IMG`), else the `lhId` suffix (`page-0-IMG`).
+ *
+ * `nodeLabel` is deliberately not used. For an image it is the `alt` text, so
+ * reading "has a label" as "is text" files every hero image as a text node.
+ */
+export function elementTagOf(node: Record<string, unknown> | undefined): string | undefined {
+  if (!node) return undefined;
+  const fromSnippet = /^<\s*([a-zA-Z][\w-]*)/.exec(asString(node.snippet))?.[1];
+  if (fromSnippet) return fromSnippet.toUpperCase();
+  const fromPath = asString(node.path).split(',').pop();
+  if (fromPath && /^[a-zA-Z][\w-]*$/.test(fromPath)) return fromPath.toUpperCase();
+  const fromId = /-([a-zA-Z][\w]*)$/.exec(asString(node.lhId))?.[1];
+  return fromId ? fromId.toUpperCase() : undefined;
+}
+
+/**
+ * Text unless the tag says image. With no tag at all, a resource-load phase is
+ * the evidence: text has no resource to load.
+ */
+function isTextElement(tag: string | undefined, phases: LcpPhases): boolean {
+  if (tag) return !IMAGE_TAGS.has(tag);
+  return phases.loadDelay === undefined && phases.loadTime === undefined;
 }
 
 /**
@@ -986,15 +1176,14 @@ export function lcpDetailFrom(reports: NormalizedReport[], medianScore: number):
   >;
   const totalMs = phaseEntries.reduce((sum, [, value]) => sum + value, 0);
 
-  const type = asString(node?.nodeType, undefined) || undefined;
-  const elementType = asString(node?.nodeLabel, undefined) ? undefined : type;
+  const tag = elementTagOf(node);
 
   const detail: LcpDetail = {
-    isText: isTextElement(elementType),
+    isText: isTextElement(tag, phases),
     phases,
     bottleneck: bottleneckOf(phases),
   };
-  if (type) detail.elementType = type;
+  if (tag) detail.elementType = tag;
   const text = asString(node?.nodeLabel, undefined);
   if (text) detail.text = text;
   const selector = asString(node?.selector, undefined);
@@ -1042,6 +1231,13 @@ function sortValue(
     return order === 'desc' ? -Infinity : Infinity;
   }
   return raw;
+}
+
+/** 0 = priced in ms, 1 = priced only in bytes, 2 = no estimate at all. */
+function savingsTier(insight: Insight): number {
+  if (insight.savingsMs !== null && insight.savingsMs !== undefined) return 0;
+  if ((insight.savingsBytes ?? 0) > 0) return 1;
+  return 2;
 }
 
 export function filterInsights<T extends Insight>(insights: T[], filters: InsightFilters = {}): T[] {
@@ -1121,6 +1317,17 @@ export function filterInsights<T extends Insight>(insights: T[], filters: Insigh
   });
 
   filtered.sort((a, b) => {
+    if (sortBy === 'savingsMs') {
+      // A finding Lighthouse priced only in bytes is not "no estimate", so it
+      // sorts after the time-priced findings and before the unpriced ones,
+      // ordered by its bytes.
+      const tier = savingsTier(a) - savingsTier(b);
+      if (tier !== 0) return tier;
+      if (savingsTier(a) === 1) {
+        const bytes = ((a.savingsBytes ?? 0) - (b.savingsBytes ?? 0)) * direction;
+        return bytes !== 0 ? bytes : a.id.localeCompare(b.id);
+      }
+    }
     const left = sortValue(a, sortBy, order);
     const right = sortValue(b, sortBy, order);
     // Guard against Infinity - Infinity, which is NaN and would make the

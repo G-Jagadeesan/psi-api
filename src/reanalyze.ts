@@ -23,7 +23,11 @@
  */
 
 import { aggregateReports } from './aggregate.js';
-import { refreshInsightSavings } from './insights.js';
+import {
+  firstPartyHostsFromEnv,
+  reclassifyInsightParties,
+  refreshInsightSavings,
+} from './insights.js';
 import { applyTargets, type Targets } from './targets.js';
 import type {
   AggregatedReport,
@@ -38,8 +42,16 @@ export interface ReanalyzeOptions {
   targets?: Targets;
 }
 
-/** Recompute every insight's savings figure in one stored run. */
-export function refreshRun(run: NormalizedReport): NormalizedReport {
+/**
+ * Recompute every insight's savings figure in one stored run, and re-judge
+ * ownership against today's `PSI_FIRST_PARTY_HOSTS` where the stored rows are
+ * complete enough to do so.
+ */
+export function refreshRun(
+  run: NormalizedReport,
+  firstPartyHosts: readonly string[] = firstPartyHostsFromEnv(),
+): NormalizedReport {
+  const measuredUrl = run.finalUrl || run.url;
   return {
     ...run,
     // Reports stored before the run environment was recorded have no `environment`
@@ -48,7 +60,9 @@ export function refreshRun(run: NormalizedReport): NormalizedReport {
     // fabricated device or CPU, which is the sort of thing that later gets cited
     // as though the run had stated it.
     environment: run.environment ?? { lighthouseVersion: run.lighthouseVersion },
-    insights: run.insights.map(refreshInsightSavings),
+    insights: run.insights.map((insight) =>
+      reclassifyInsightParties(refreshInsightSavings(insight), measuredUrl, firstPartyHosts),
+    ),
   };
 }
 
@@ -67,7 +81,7 @@ export function reanalyze(runs: NormalizedReport[], options: ReanalyzeOptions): 
     throw new Error(`no stored runs for report "${options.reportId}"`);
   }
 
-  const refreshed = runs.map(refreshRun);
+  const refreshed = runs.map((run) => refreshRun(run));
   // `strategy` is not an aggregate option: it is carried on the runs themselves,
   // so the rebuilt report inherits it from the data rather than from the caller.
   const aggregated = aggregateReports(refreshed, {

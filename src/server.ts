@@ -11,6 +11,7 @@ import type { AggregatedReport, FilterGroup, Job, MetricKey, SortField, SortOrde
 import { METRIC_KEYS, STATS, STRATEGIES } from './types.js';
 import { filterInsights } from './insights.js';
 import { diagnose } from './diagnose.js';
+import { imagesOf } from './images.js';
 import { InsufficientRunsError, MAX_RUNS, runReport } from './runner.js';
 import { UrlValidationError } from './psiClient.js';
 import { loadReport } from './storage.js';
@@ -356,6 +357,7 @@ export function buildServer(): FastifyInstance {
         targets: report.targets,
         lcp: report.lcp,
         distributions: report.distributions,
+        images: imagesOf(report),
         ...diagnosisPayload(report, filterParams.parse(compact(req.query))),
       });
     },

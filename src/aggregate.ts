@@ -15,6 +15,7 @@ import type {
 } from './types.js';
 import { METRIC_KEYS, STATS } from './types.js';
 import { lcpDetailFrom } from './insights.js';
+import { imageChecks } from './images.js';
 
 export const FLAKY_THRESHOLD = 0.3;
 export const MIN_SUCCESS_RATIO = 0.6;
@@ -316,6 +317,24 @@ function pickStat(stats: SeriesStats, stat: Stat): number {
   return stats[stat];
 }
 
+/**
+ * The rows of an insight and the ownership counts worked out from them.
+ *
+ * They move together. Borrowing another run's rows while keeping this run's
+ * counts produced "0 first-party / 0 third-party" beside four first-party rows,
+ * which made a finding on the site's own images read as unowned.
+ */
+function rowFields(insight: Insight): Partial<Insight> {
+  return {
+    items: insight.items,
+    itemsTotal: insight.itemsTotal,
+    firstPartyItems: insight.firstPartyItems,
+    thirdPartyItems: insight.thirdPartyItems,
+    itemHosts: insight.itemHosts,
+    firstPartyShare: insight.firstPartyShare,
+  };
+}
+
 /** Mutable accumulator while walking the runs. */
 interface InsightAccumulator {
   representative: Insight;
@@ -349,11 +368,7 @@ function accumulateInsights(reports: NormalizedReport[]): Map<string, InsightAcc
 
       // Prefer metadata from an occurrence that actually carries it.
       if (existing.representative.items === undefined && insight.items !== undefined) {
-        existing.representative = {
-          ...existing.representative,
-          items: insight.items,
-          itemsTotal: insight.itemsTotal,
-        };
+        existing.representative = { ...existing.representative, ...rowFields(insight) };
       }
       if (existing.representative.metricsAffected === undefined && insight.metricsAffected !== undefined) {
         existing.representative = {
@@ -423,10 +438,7 @@ function aggregateInsights(
     const fromMedian = medianRunById.get(id);
     const base: Insight = { ...(fromMedian ?? acc.representative) };
     const fallback = acc.representative;
-    if (base.items === undefined && fallback.items !== undefined) {
-      base.items = fallback.items;
-      base.itemsTotal = fallback.itemsTotal;
-    }
+    if (base.items === undefined && fallback.items !== undefined) Object.assign(base, rowFields(fallback));
     if (base.metricsAffected === undefined && fallback.metricsAffected !== undefined) {
       base.metricsAffected = fallback.metricsAffected;
     }
@@ -525,6 +537,10 @@ export function aggregateReports(
   }
 
   const first = reports[0];
+  const medianRun = medianRunOf(reports, score.median);
+  const strategy = first?.strategy ?? 'mobile';
+  const lcp = lcpDetailFrom(reports, score.median);
+  const insights = aggregateInsights(reports, score.median, stat);
 
   return {
     reportId,
@@ -538,19 +554,29 @@ export function aggregateReports(
     lighthouseVersion: first?.lighthouseVersion ?? 'unknown',
     // The median run, for the same reason `items` come from it: the headline
     // describes that run, so the conditions behind it are that run's.
-    environment: medianRunOf(reports, score.median)?.environment ?? {
+    environment: medianRun?.environment ?? {
       lighthouseVersion: first?.lighthouseVersion ?? 'unknown',
     },
     headline: { score: pickStat(score, stat), metrics: headlineMetrics },
     score,
     metrics,
     distributions: distributionsFor(score, metrics),
-    lcp: lcpDetailFrom(reports, score.median),
+    lcp,
+    requests: medianRun?.requests ?? null,
+    // From the aggregated insights, not the median run's: a passing insight can
+    // carry no rows in one run and all of them in the next.
+    images: imageChecks({
+      insights,
+      requests: medianRun?.requests,
+      screen: medianRun?.environment?.screen,
+      strategy,
+      lcp,
+    }),
     stats: statsByStat,
-    insights: aggregateInsights(reports, score.median, stat),
+    insights,
     fieldData: first?.fieldData ?? null,
     // Filled in by the runner once targets are known.
-    targets: { strategy: first?.strategy ?? 'mobile', targets: {}, meetsTarget: false, gaps: [] },
+    targets: { strategy, targets: {}, meetsTarget: false, gaps: [] },
     errors,
   };
 }

@@ -26,7 +26,7 @@ import type {
   SeriesStats,
 } from './types.js';
 import { METRIC_KEYS } from './types.js';
-import { filterInsights, firstPartyShareOf, isMetricAudit } from './insights.js';
+import { filterInsights, firstPartyShareOf, isMetricAudit, isOwnUrl } from './insights.js';
 import { medianMeets } from './targets.js';
 
 /**
@@ -101,10 +101,31 @@ export const INSIGHT_SOP: Record<string, { sop: string; action: string }> = {
   'total-byte-weight': { sop: '§8', action: 'Total transfer weight - a summary, not a single fix' },
 };
 
+/**
+ * Lighthouse's simulated throughput, in kilobits per second.
+ *
+ * Used only to put a byte-priced finding on the same scale as a time-priced one
+ * for ranking. The figure is transfer time on PSI's throttled link, which
+ * overstates the cost of bytes that are not on the critical path.
+ */
+const THROUGHPUT_KBPS: Record<string, number> = { mobile: 1638.4, desktop: 10240 };
+
+export function bytesToTransferMs(bytes: number, strategy: string): number {
+  const kbps = THROUGHPUT_KBPS[strategy] ?? THROUGHPUT_KBPS.mobile!;
+  return (bytes * 8) / kbps;
+}
+
 export interface RankedInsight {
   insight: AggregatedInsight;
   /** 1 = highest priority. */
   rank: number;
+  /**
+   * The time figure the insight was ranked on: `savingsMs`, or for a finding
+   * Lighthouse priced only in bytes, those bytes as transfer time.
+   */
+  rankingMs: number;
+  /** True when `rankingMs` was converted from bytes rather than estimated by Lighthouse. */
+  rankingFromBytes: boolean;
   /** Metrics that failed and that this insight claims to affect. */
   affectsFailing: MetricKey[];
   /** Share of the cost that is yours: 0-1, or null when unattributed. */
@@ -220,11 +241,18 @@ export function rankInsights(
   // Lighthouse considers fine outranked a 601ms render-blocking diagnostic,
   // purely because it nominally touched an unstable metric. The work queue must
   // not depend on which surface asked for it.
+  //
+  // Lighthouse also scores an insight as passing while it still names bytes that
+  // can be removed (`image-delivery-insight` at 76 KiB, scored 1). Those are
+  // admitted by default. A passing audit priced only in time is not: that is
+  // the bootup-time case above, a 50-100ms TBT figure Lighthouse considers fine.
+  const explicitGroup = options.filters?.group;
   const candidates = filterInsights(report.insights, {
     includeFlaky: false,
     ...options.filters,
-    group: options.filters?.group ?? ['opportunity', 'diagnostic'],
+    group: explicitGroup ?? ['opportunity', 'diagnostic', 'passed'],
   }).filter((insight) => {
+    if (!explicitGroup && insight.group === 'passed' && !((insight.savingsBytes ?? 0) > 0)) return false;
     // A metric audit is the failing number restated, not a cause of it, and it
     // has no playbook to route to. The gap list already says it is over budget.
     if (isMetricAudit(insight.id)) return false;
@@ -246,7 +274,9 @@ export function rankInsights(
       unreliable.has(metric as MetricKey),
     );
 
-    const saving = insight.savingsMs ?? 0;
+    const bytes = insight.savingsBytes ?? 0;
+    const rankingFromBytes = (insight.savingsMs ?? 0) <= 0 && bytes > 0;
+    const saving = rankingFromBytes ? bytesToTransferMs(bytes, report.strategy) : (insight.savingsMs ?? 0);
     // A finding that only affects an unstable metric is a weak candidate, and a
     // flaky one cannot be proven by re-measurement, so both push it down.
     let score = saving + affectsFailing.length * 100_000;
@@ -262,17 +292,32 @@ export function rankInsights(
     if (affectsUnreliable) reasons.push('affects an unstable metric');
     if (thirdPartyOnly) reasons.push('third-party cost only - document, do not fix');
     else if (share !== null) reasons.push(`${Math.round(share * 100)}% first-party`);
-    if (saving > 0) reasons.push(`${Math.round(saving)}ms est. saving`);
+    if (rankingFromBytes) {
+      reasons.push(
+        `${Math.round(bytes / 1024)} KiB est. saving (~${Math.round(saving)}ms of transfer on PSI's ` +
+          `${report.strategy} link, a ranking estimate only)`,
+      );
+    } else if (saving > 0) reasons.push(`${Math.round(saving)}ms est. saving`);
     else reasons.push('no size estimate');
+    if (insight.group === 'passed') reasons.push('Lighthouse scores it as passing, but the bytes are real');
+
+    // The generic route for this insight is "someone else's code". Rows on the
+    // site's own domains are not, and have to be routed as the resources they are.
+    const sop =
+      insight.id === 'third-parties-insight' && insight.firstPartyItems > 0
+        ? { sop: '§6/§8', action: 'Rows on your own domains are yours: work them as image or script findings' }
+        : INSIGHT_SOP[insight.id];
 
     return {
       insight,
       rank: 0,
+      rankingMs: Math.round(saving),
+      rankingFromBytes,
       affectsFailing,
       firstPartyShare: share,
       thirdPartyOnly,
       estimateFromText: insight.savingsSource === 'displayValue',
-      sop: INSIGHT_SOP[insight.id],
+      sop,
       reason: reasons.join('; '),
       score,
     } satisfies RankedInsight & { score: number };
@@ -347,6 +392,34 @@ function cautionsFor(report: AggregatedReport, ranked: RankedInsight[]): string[
     }
   }
 
+  const documentBytes = documentTransferSize(report);
+  if (documentBytes !== undefined && documentBytes > HEAVY_DOCUMENT_BYTES) {
+    cautions.push(
+      `The HTML document is ${Math.round(documentBytes / 1024)} KB compressed. The browser discovers the LCP ` +
+        'image, stylesheets and fonts only as it parses it, so a heavy document delays all of them. Look for ' +
+        'long lists rendered up front, duplicated markup and large serialized state.',
+    );
+  }
+
+  const dom = domSizeOf(report);
+  if (dom && dom.elements > LARGE_DOM_ELEMENTS) {
+    cautions.push(
+      `The page has ${dom.elements.toLocaleString('en-US')} DOM elements.` +
+        (dom.widest
+          ? ` The widest node holds ${dom.widest.children} children (${dom.widest.selector}) - render it when it is opened, not in the server HTML.`
+          : ''),
+    );
+  }
+
+  const chain = longestChain(report);
+  if (chain && chain.thirdPartyHosts.length > 0) {
+    cautions.push(
+      `The longest request chain (${chain.durationMs}ms) runs through third-party requests ` +
+        `(${chain.thirdPartyHosts.join(', ')}). Loaded async they do not block the first paint, but they compete ` +
+        'with the page for bandwidth. Check who injects them before counting them as work.',
+    );
+  }
+
   const textEstimated = ranked.filter((entry) => entry.estimateFromText);
   if (textEstimated.length > 0) {
     cautions.push(
@@ -364,6 +437,73 @@ function cautionsFor(report: AggregatedReport, ranked: RankedInsight[]): string[
   }
 
   return cautions;
+}
+
+/** Compressed HTML above this delays everything discovered from it. */
+export const HEAVY_DOCUMENT_BYTES = 60 * 1024;
+/** Lighthouse's own failing threshold for DOM size. */
+export const LARGE_DOM_ELEMENTS = 1400;
+
+function documentTransferSize(report: AggregatedReport): number | undefined {
+  const fromRequests = report.requests?.find(
+    (request) => request.resourceType === 'Document' && request.transferSize !== undefined,
+  );
+  if (fromRequests) return fromRequests.transferSize;
+  const weight = report.insights.find((insight) => insight.id === 'total-byte-weight');
+  for (const row of (weight?.items ?? []) as Array<Record<string, unknown>>) {
+    if (row.resourceType === 'Document' && typeof row.totalBytes === 'number') return row.totalBytes;
+  }
+  return undefined;
+}
+
+function domSizeOf(
+  report: AggregatedReport,
+): { elements: number; widest?: { children: number; selector: string } } | undefined {
+  const insight = report.insights.find((entry) => entry.id === 'dom-size-insight');
+  const rows = (insight?.items ?? []) as Array<{
+    statistic?: string;
+    value?: { value?: number };
+    node?: { selector?: string };
+  }>;
+  const elements = rows.find((row) => row.statistic === 'Total elements')?.value?.value;
+  if (typeof elements !== 'number') return undefined;
+  const widest = rows.find((row) => row.statistic === 'Most children');
+  const children = widest?.value?.value;
+  const selector = widest?.node?.selector;
+  return typeof children === 'number' && selector
+    ? { elements, widest: { children, selector } }
+    : { elements };
+}
+
+interface ChainNode {
+  url?: string;
+  isLongest?: boolean;
+  children?: Record<string, ChainNode>;
+}
+
+/** The longest chain from `network-dependency-tree-insight`, and the foreign hosts on it. */
+function longestChain(report: AggregatedReport): { durationMs: number; thirdPartyHosts: string[] } | undefined {
+  const insight = report.insights.find((entry) => entry.id === 'network-dependency-tree-insight');
+  const tree = ((insight?.items ?? []) as Array<{
+    value?: { type?: string; chains?: Record<string, ChainNode>; longestChain?: { duration?: number } };
+  }>).find((section) => section.value?.type === 'network-tree')?.value;
+  if (!tree?.chains || typeof tree.longestChain?.duration !== 'number') return undefined;
+
+  const hosts = new Set<string>();
+  let level: Record<string, ChainNode> | undefined = tree.chains;
+  while (level) {
+    const next: ChainNode | undefined = Object.values(level).find((node) => node.isLongest);
+    if (!next) break;
+    if (next.url && !isOwnUrl(next.url, report.finalUrl || report.url)) {
+      try {
+        hosts.add(new URL(next.url).host);
+      } catch {
+        /* not a URL - nothing to attribute */
+      }
+    }
+    level = next.children;
+  }
+  return { durationMs: Math.round(tree.longestChain.duration), thirdPartyHosts: [...hosts] };
 }
 
 /**

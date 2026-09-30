@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { aggregateReports } from '../src/aggregate.js';
-import { diagnose, INSIGHT_SOP, METRIC_PRIORITY, rankInsights } from '../src/diagnose.js';
+import { bytesToTransferMs, diagnose, INSIGHT_SOP, METRIC_PRIORITY, rankInsights } from '../src/diagnose.js';
 import { applyTargets } from '../src/targets.js';
 import type { AggregatedInsight, AggregatedReport, Insight } from '../src/types.js';
 import { normalizeLh13 } from './helpers.js';
@@ -310,5 +310,192 @@ describe('hand-built insights', () => {
       filters: { group: ['opportunity', 'diagnostic'] },
     }).map((entry) => entry.insight.id);
     expect(implicit).toEqual(explicit);
+  });
+});
+
+describe('queue admission and ranking of byte-priced findings', () => {
+  const base: AggregatedInsight = {
+    id: 'x',
+    title: 't',
+    description: '',
+    score: 0,
+    scoreDisplayMode: 'metricSavings',
+    group: 'opportunity',
+    savingsMs: null,
+    savingsBytes: null,
+    firstPartyItems: 1,
+    thirdPartyItems: 0,
+    itemHosts: ['example.com'],
+    firstPartyShare: 1,
+    metricsAffected: ['fcp'],
+    appearedInRuns: 1,
+    runsSucceeded: 1,
+    flaky: false,
+    stats: { score: { mean: 0, median: 0, mode: 0 }, savingsMs: null, savingsBytes: null },
+  };
+  const insight = (id: string, extra: Partial<AggregatedInsight> = {}): AggregatedInsight => ({
+    ...base,
+    id,
+    ...extra,
+  });
+  const failingFcp = (insights: AggregatedInsight[], extra: Partial<AggregatedReport> = {}): AggregatedReport => ({
+    ...PASSING,
+    targets: {
+      ...PASSING.targets,
+      meetsTarget: false,
+      gaps: PASSING.targets.gaps.map((gap) =>
+        gap.metric === 'fcp' ? { ...gap, meets: false, actual: 2200, delta: 400 } : gap,
+      ),
+    },
+    insights,
+    ...extra,
+  });
+
+  it('admits a passing insight that still names removable bytes', () => {
+    // image-delivery-insight scores 1 with 76 KiB of real waste on the site's
+    // own images; filed under `passed`, it never reached the queue.
+    const report = failingFcp([insight('image-delivery-insight', { group: 'passed', score: 1, savingsBytes: 77_000 })]);
+    const [entry] = rankInsights(report);
+    expect(entry?.insight.id).toBe('image-delivery-insight');
+    expect(entry?.reason).toMatch(/scores it as passing/);
+  });
+
+  it('still keeps out a passing audit priced only in time', () => {
+    const report = failingFcp([insight('bootup-time', { group: 'passed', score: 1, savingsMs: 100 })]);
+    expect(rankInsights(report)).toEqual([]);
+  });
+
+  it('ranks a byte-only finding on its transfer time instead of burying it', () => {
+    // 200 KB on PSI's 1.6 Mbps mobile link is ~1000ms of transfer, which beats a
+    // 100ms finding; before, anything without a ms estimate ranked as zero.
+    const report = failingFcp([
+      insight('small-ms', { savingsMs: 100 }),
+      insight('big-bytes', { savingsBytes: 200 * 1024 }),
+    ]);
+    const ranked = rankInsights(report);
+    expect(ranked.map((entry) => entry.insight.id)).toEqual(['big-bytes', 'small-ms']);
+    expect(ranked[0]?.rankingFromBytes).toBe(true);
+    expect(ranked[0]?.rankingMs).toBe(Math.round(bytesToTransferMs(200 * 1024, 'mobile')));
+    expect(ranked[0]?.reason).toMatch(/200 KiB est\. saving \(~1000ms/);
+  });
+
+  it('converts bytes at the desktop link speed for a desktop report', () => {
+    expect(bytesToTransferMs(1280, 'desktop')).toBeCloseTo(1, 5);
+    expect(bytesToTransferMs(204.8, 'mobile')).toBeCloseTo(1, 5);
+  });
+
+  it('routes a third-parties row on the site’s own domain as its own work', () => {
+    const report = failingFcp([
+      insight('third-parties-insight', { firstPartyItems: 1, thirdPartyItems: 1, firstPartyShare: 0.5 }),
+    ]);
+    const [entry] = rankInsights(report);
+    expect(entry?.sop?.action).toMatch(/own domains are yours/);
+    const vendorOnly = failingFcp([
+      insight('third-parties-insight', { firstPartyItems: 0, thirdPartyItems: 1, firstPartyShare: 0 }),
+    ]);
+    expect(rankInsights(vendorOnly)[0]?.sop).toEqual(INSIGHT_SOP['third-parties-insight']);
+  });
+});
+
+describe('page-weight cautions', () => {
+  const statInsight = (id: string, items: unknown[]): AggregatedInsight => ({
+    id,
+    title: id,
+    description: '',
+    score: 0,
+    scoreDisplayMode: 'informative',
+    group: 'informative',
+    savingsMs: null,
+    savingsBytes: null,
+    firstPartyItems: 0,
+    thirdPartyItems: 0,
+    itemHosts: [],
+    items,
+    appearedInRuns: 1,
+    runsSucceeded: 1,
+    flaky: false,
+    stats: { score: { mean: 0, median: 0, mode: 0 }, savingsMs: null, savingsBytes: null },
+  });
+
+  it('warns about a heavy HTML document from the request table', () => {
+    const report: AggregatedReport = {
+      ...PASSING,
+      requests: [
+        { url: `${PASSING.url}`, resourceType: 'Document', transferSize: 103 * 1024, party: 'first' },
+      ],
+    };
+    expect(diagnose(report).cautions.join(' ')).toMatch(/HTML document is 103 KB/);
+  });
+
+  it('falls back to total-byte-weight when the report has no request table', () => {
+    const report: AggregatedReport = {
+      ...PASSING,
+      requests: null,
+      insights: [statInsight('total-byte-weight', [{ url: PASSING.url, resourceType: 'Document', totalBytes: 90 * 1024 }])],
+    };
+    expect(diagnose(report).cautions.join(' ')).toMatch(/HTML document is 90 KB/);
+  });
+
+  it('stays quiet about a light document', () => {
+    const report: AggregatedReport = {
+      ...PASSING,
+      requests: [{ url: PASSING.url, resourceType: 'Document', transferSize: 20 * 1024, party: 'first' }],
+    };
+    expect(diagnose(report).cautions.join(' ')).not.toMatch(/HTML document/);
+  });
+
+  it('names the widest DOM node when the page is over Lighthouse’s element limit', () => {
+    const report: AggregatedReport = {
+      ...PASSING,
+      insights: [
+        statInsight('dom-size-insight', [
+          { statistic: 'Total elements', value: { type: 'numeric', value: 4406 } },
+          { statistic: 'Most children', value: { type: 'numeric', value: 251 }, node: { type: 'node', selector: 'details#country > div' } },
+        ]),
+      ],
+    };
+    const text = diagnose(report).cautions.join(' ');
+    expect(text).toMatch(/4,406 DOM elements/);
+    expect(text).toMatch(/251 children \(details#country > div\)/);
+  });
+
+  it('flags third-party requests on the longest request chain', () => {
+    const tree = {
+      type: 'list-section',
+      value: {
+        type: 'network-tree',
+        longestChain: { duration: 2218 },
+        chains: {
+          a: {
+            url: PASSING.url,
+            isLongest: true,
+            children: {
+              b: { url: `${new URL(PASSING.url).origin}/style.css`, children: {} },
+              c: {
+                url: 'https://static.cloudflareinsights.com/beacon.min.js',
+                isLongest: true,
+                children: { d: { url: `${new URL(PASSING.url).origin}/cdn-cgi/rum`, isLongest: true, children: {} } },
+              },
+            },
+          },
+        },
+      },
+    };
+    const report: AggregatedReport = { ...PASSING, insights: [statInsight('network-dependency-tree-insight', [tree])] };
+    const text = diagnose(report).cautions.join(' ');
+    expect(text).toMatch(/longest request chain \(2218ms\) runs through third-party requests \(static\.cloudflareinsights\.com\)/);
+  });
+
+  it('says nothing about a longest chain that is entirely first-party', () => {
+    const tree = {
+      type: 'list-section',
+      value: {
+        type: 'network-tree',
+        longestChain: { duration: 900 },
+        chains: { a: { url: PASSING.url, isLongest: true, children: {} } },
+      },
+    };
+    const report: AggregatedReport = { ...PASSING, insights: [statInsight('network-dependency-tree-insight', [tree])] };
+    expect(diagnose(report).cautions.join(' ')).not.toMatch(/longest request chain/);
   });
 });

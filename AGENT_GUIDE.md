@@ -47,7 +47,7 @@ Record the whole output, especially `headline`, `score.stddev`, and the gaps.
 
 ### Step 2 — Stop condition
 
-If `meetsTarget` is `true`, **stop.** Report success with before/after numbers. Do not keep hunting for wins; the target is met.
+If `meetsTarget` is `true`, run the same measurement with `--strategy desktop`. If that meets its target too, **stop.** Report success with before/after numbers for both. Do not keep hunting for wins; the target is met. If desktop fails, it is the next iteration (Step 3d, playbook 8).
 
 If `meetsTarget` is `false`, read `targets.gaps` to see exactly which metric is over budget:
 
@@ -130,20 +130,22 @@ Before applying any image advice, read `lcp` from the report (or the `LCP ELEMEN
 
 ```json
 {
-  "isText": true,
-  "phases": { "ttfb": 578.17, "renderDelay": 1083.34 },
-  "totalMs": 1662,
-  "dominantPhase": "renderDelay",
-  "bottleneck": "render"
+  "isText": false,
+  "elementType": "IMG",
+  "snippet": "<img decoding=\"async\" loading=\"eager\" alt=\"…\" fetchpriority=\"high\" …>",
+  "phases": { "ttfb": 500, "loadDelay": 632, "loadTime": 439, "renderDelay": 344 },
+  "totalMs": 1915,
+  "dominantPhase": "loadDelay",
+  "bottleneck": "resource"
 }
 ```
 
 Two facts decide which playbook applies, and neither is visible in the LCP number:
 
-- **`isText`** — if the LCP element is a text node there is no image to prioritise, lazy-load or resize, so `lcp-discovery-insight`, `prioritize-lcp-image-insight` and `lcp-lazy-loaded-insight` do not apply to this page. On the deployed page the LCP element is a `<div>` of body copy, and `lcp-discovery-insight` is `notApplicable`.
-- **`bottleneck`** — `loadDelay`/`loadTime` means fetch earlier; `renderDelay` means something is blocking paint, usually CSS; `ttfb` means the server is the constraint and no component change will help.
+- **`isText`** — if the LCP element is a text node there is no image to prioritise, lazy-load or resize, so `lcp-discovery-insight`, `prioritize-lcp-image-insight` and `lcp-lazy-loaded-insight` do not apply. The tag is read from the snippet (or the DOM path), never from `nodeLabel` — an image's label is its `alt` text. Trust `isText` and `elementType`.
+- **`bottleneck`** — `loadDelay`/`loadTime` means fetch earlier; `renderDelay` means something is blocking paint, usually CSS; `ttfb` means the server is the constraint and no component change will help. `loadTime` is Lighthouse 13's `resourceLoadDuration`.
 
-There is deliberately no load phase when the LCP element is text, because there is no resource to load. That absence is the finding.
+A genuinely text LCP element has no load phase, because there is no resource to load. That absence is the finding.
 
 ### Step 3b — Do not trust a savings figure of zero
 
@@ -158,6 +160,153 @@ So a cost that was being reported as nothing is now visible. On the deployed pag
 | `image-delivery-insight` | 0 ms | 33 KiB | `displayValue` |
 
 Treat `none` as "Lighthouse gave no estimate", which is a different fact from "no gain" — and a real failure with no estimate can still be the right thing to fix.
+
+### Step 3c — Read the rows, not just the ranking
+
+`--diagnose` tells you *which* finding to work on. The finding's rows tell you *what to change*. Open them without another PSI run:
+
+```bash
+npm run psi -- --reportId <id> --diagnose --party first
+npm run psi -- --reportId <id> --items image-delivery-insight,third-parties-insight
+npm run psi -- --reportId <id> --requests size --limit 20
+```
+
+`--diagnose` already prints the LCP element, the ranked queue, **IMAGE CHECKS** (oversized after pixel-density correction, `srcset` without `sizes`, eager-offscreen, lazy-in-fold, heavy SVGs), and cautions for a heavy HTML document or a third-party on the longest request chain. `--items` prints every row of named insights. `--requests` prints every request the median run made.
+
+It also:
+
+- **Counts GUVI-owned hosts as yours** when `PSI_FIRST_PARTY_HOSTS` is set (see §4). `static.guvi.in` then scores as first-party, not as "document, do not attempt".
+- **Queues passed findings that still have byte savings.** `image-delivery-insight` scored 1 on zen-class with 76 KiB still to save; it is in the queue, labelled as passing.
+- **Ranks byte-only savings.** `unused-javascript` at 84 KiB is converted to an equivalent transfer time for ranking only; the reason line says so.
+
+Rows come from the run whose score is closest to the median, trimmed to the top 25 (`itemsTotal` is the real count); nested `subItems` are complete. The fields that matter:
+
+| Field | Where | Use it for |
+| --- | --- | --- |
+| `node.selector`, `node.snippet`, `node.path` | `--items` | The grep gate. The snippet carries `loading`, `fetchpriority`, `srcset`, `sizes`, `width`/`height`. |
+| `node.boundingRect` | `--items` | Where the element rendered. `top` ≥ the emulated viewport height (823 on mobile) is below the first fold; `left` ≥ width or negative is off-screen horizontally. |
+| `subItems.items[].reason` | `image-delivery-insight` | Intrinsic vs displayed size, or the compression/format problem. Prefer IMAGE CHECKS for the density-corrected verdict. |
+| `url`, `resourceType`, `transferSize` | `--items` / `--requests` | What was fetched and how heavy it was. |
+| `wastedBytes`, `wastedMs`, `wastedPercent` | opportunity rows | The size of the problem on that one resource. |
+| `entity`, `mainThreadTime` | `third-parties-insight` | Who owns the cost, and whether it costs CPU or only bytes. |
+
+### Step 3d — Playbooks for findings Lighthouse under-explains
+
+Each playbook is *signal → confirm → allowed fix*. Every fix still goes through the grep gate and the SOP in Step 4. Examples are from `qwik-guvi-perf-fix…/zen-class/`, report `2026-09-30T08-04-23Z-mobile`.
+
+PSI's mobile run emulates a **412 × 823 CSS-pixel viewport at device pixel ratio 1.75** (moto g power). Desktop is 1350 × 940 at ratio 1. Use these numbers, not your own screen, whenever a rule below says "first fold" or "displayed size".
+
+#### 1. The LCP image is requested late
+
+- **Signal.** Image LCP (see Step 3a) with a `resourceLoadDelay` over ~300 ms, even though `lcp-discovery-insight` passes (`fetchpriority=high`, eager, discoverable). On zen-class the delay is 632 ms.
+- **Why.** The browser's preload scanner only meets the `<img>` when it has parsed that far into the HTML. The zen-class document is 103 KB on the wire and the hero sits deep inside `<main>`, so the image request starts only as the document finishes (~1.15 s).
+- **Fix.** Declare the image in the head so it is requested alongside the HTML: `<link rel="preload" as="image" fetchpriority="high" imagesrcset="…" imagesizes="…" media="…">` via the route's `head` export. It must match the exact `srcset`/`sizes`/`media` the `<picture>` uses at that breakpoint — a mismatch downloads the hero twice. Add a `media` query so desktop does not fetch the mobile hero. Then shrink the HTML (playbook 5), which helps every late request.
+- **Confirm.** DevTools Network at 412 px wide: the hero is requested once, with High priority, near the top of the waterfall.
+
+#### 2. Images larger than they render
+
+- **Signal.** IMAGE CHECKS `oversized` / `no sizes` / `heavy` rows in `--diagnose`. Confirm with `--items image-delivery-insight`.
+- **Correct for pixel density first.** Displayed dimensions are CSS pixels. IMAGE CHECKS already multiplies by the emulated device pixel ratio (1.75 on mobile) and only flags real waste when the intrinsic width is ≳ 1.3× that. A row labelled `fine` is an artifact — leave the image alone.
+  - The zen-class hero is 750 px wide for 412 CSS px. It needs 721, so it is right-sized; its "34 KB waste" is an artifact. Do not shrink it — it would go blurry on real phones.
+  - The partner logos are 714 px wide for 251 CSS px. They need ~440, so the waste is real.
+- **Most common cause: `srcset` with `w` descriptors and no `sizes`.** Without `sizes` the browser assumes the image is 100vw and picks the largest candidate that covers 412 × 1.75. Every partner logo on zen-class has `srcset="… 200w, … 400w, …"` and no `sizes`, so each phone downloads the 714 px file. The fix is a correct `sizes` for the rendered width (or the Unpic component with explicit `width`, which emits it), not re-encoding or swapping the asset.
+- **Heavy vector files.** Check `total-byte-weight` for any SVG over ~50 KB — that is almost always an embedded bitmap. `static.guvi.in/zen-class-revamp/tools/devops.svg` is **576 KB**, a third of the page's 1.7 MB. An asset on the CDN cannot be re-encoded from this repo: log it with its size and URL, make sure it is lazy-loaded if it sits below the fold, and escalate the asset itself. Never swap it for a different-looking asset (SOP §6).
+
+#### 3. Lazy-loading: what loads that should not, and what waits that should not
+
+`--diagnose` IMAGE CHECKS already flags eager-offscreen and lazy-in-fold elements Lighthouse attached a node to, and `--requests` lists every image that actually loaded. CSS `background-image` still does not appear in either, so for those (and anything the snippet was clipped on) check the deployed page. Open it at 412 × 823, let it load **without scrolling**, and run in the console:
+
+```js
+[...document.querySelectorAll('img, iframe, video')]
+  .map((el) => {
+    const r = el.getBoundingClientRect();
+    return {
+      tag: el.tagName,
+      src: (el.currentSrc || el.src || '').slice(0, 90),
+      top: Math.round(r.top + scrollY),
+      offscreenX: r.left >= innerWidth || r.right <= 0,
+      loading: el.getAttribute('loading'),
+      fetchpriority: el.getAttribute('fetchpriority'),
+      below: r.top >= innerHeight,
+    };
+  })
+  .filter((x) => ((x.below || x.offscreenX) && x.loading !== 'lazy') || (!x.below && !x.offscreenX && x.loading === 'lazy'));
+```
+
+- **Below the fold or off-screen horizontally, and not lazy** → add `loading="lazy"`. This includes carousel slides past the first and images inside closed drawers or menus.
+- **In the first fold and lazy** → make it eager. The LCP image is never lazy.
+- **Exactly one element gets `fetchpriority="high"`:** the LCP image. A second one competes with it.
+- **`iframe`** (YouTube, maps) below the fold → `loading="lazy"`. A click-to-load facade is better but is new UI; check the SOP first. **`video`** below the fold → `preload="none"` with a `poster`.
+- Then check what was actually fetched before LCP: `performance.getEntriesByType('resource').filter((e) => e.initiatorType === 'img' && e.startTime < 2500)`. An image in that list that the first script said is below the fold is a missed lazy-load.
+
+CSS `background-image` does not appear in either list. Check sections with large backgrounds by hand.
+
+#### 4. Third-party requests that do not need to be there
+
+- **Signal.** `third-parties-insight` rows (`entity`, `transferSize`, `mainThreadTime`, and each resource under `subItems`). Also any vendor URL in `network-dependency-tree-insight`'s chains, or in `legacy-javascript-insight` / `cache-insight`.
+- **Inventory in the browser:**
+
+  ```js
+  Object.entries(performance.getEntriesByType('resource').reduce((acc, e) => {
+    const host = new URL(e.name).host;
+    acc[host] = acc[host] || { requests: 0, kb: 0 };
+    acc[host].requests += 1;
+    acc[host].kb += Math.round(e.transferSize / 1024);
+    return acc;
+  }, {})).sort((a, b) => b[1].kb - a[1].kb);
+  ```
+
+- **Decide by who put it there:**
+
+| Situation | Action |
+| --- | --- |
+| Grep finds nothing — injected by the platform | Not fixable in the repo. On zen-class, `static.cloudflareinsights.com/beacon.min.js` plus `/cdn-cgi/rum` is Cloudflare Web Analytics, injected at the edge, and is the page's longest request chain. Log it and escalate: it is switched off in the Cloudflare dashboard, not in code. |
+| In the repo, only needed on interaction (reCAPTCHA, chat widget, video player, maps) | Load it at the point of use — on form focus, on click — with a dynamic import (SOP §8). reCAPTCHA on a below-fold form should not load on page load. |
+| In the repo, analytics or tag manager | Deferring until after load is allowed if the SOP permits; **removing** tracking is a business decision. Ask. |
+| A GUVI-owned host (`static.guvi.in`) | First-party once `PSI_FIRST_PARTY_HOSTS` includes `guvi.in`. Use the image playbooks. |
+
+Never edit a vendor's script, and never add Partytown or any other package to move scripts off the main thread without senior approval (SOP §10.3).
+
+#### 5. HTML weight and DOM size
+
+- **Signal.** The `Document` row of `total-byte-weight` (zen-class: 103 KB compressed), and `dom-size-insight` (zen-class: 4,406 elements). The "Most children" row names the worst node — on zen-class, a 251-entry country-code list inside `details#request-formmobile-input`, far below the fold. A heavy document delays everything discovered from it, including the LCP image (playbook 1).
+- **Measure:**
+
+  ```bash
+  curl -s --compressed https://<host>/<page>/ -o page.html
+  wc -c page.html                                              # uncompressed HTML
+  grep -o '<script type="qwik/json">.*</script>' page.html | wc -c   # serialized state
+  grep -o '<svg' page.html | wc -l                             # inline SVGs
+  ```
+
+- **Fix, within SOP §4/§7:**
+  - Render long option lists (countries, course catalogues) when the control opens, not in the server HTML.
+  - Do not render two copies of a section (a `…mobile…` and a desktop variant) and hide one with CSS, when one responsive copy would do.
+  - Keep static data as module constants, never in a `useStore` — a store is serialized into `qwik/json` on every page load.
+
+#### 6. The FCP path: render-blocking CSS and fonts
+
+- **Signal.** `network-dependency-tree-insight` shows the chain, and `render-blocking-insight` / `unused-css-rules` price it. On zen-class the chain is HTML (done 1.15 s) → one 46 KB stylesheet, 92% unused on this page (done 1.80 s) → five font files discovered only from that CSS (done 1.97–2.12 s). FCP is 1.99 s: the stylesheet *is* the FCP.
+- **Fix, within the SOP:**
+  - Shrink what the first paint waits for. Move page-specific styles into colocated `*.module.css` so the global stylesheet carries only shared rules; the critical-CSS approach is the SOP's call (§8), not yours.
+  - Preload only the one or two font files used by first-fold text (`<link rel="preload" as="font" type="font/woff2" crossorigin href="…">`), and update the `@font-face` and every preload together (SOP §6). Preloading all five competes with the CSS and the hero.
+- **Preconnects.** The same insight's "Preconnect candidates" section says whether a `preconnect` would help. Add one only when it names an origin.
+
+#### 7. Attributing unused JavaScript to source
+
+- Qwik chunk names are content hashes, so `unused-javascript`, `bootup-time` and `long-tasks` name files like `q-BCYPl1tV.js`. Build the **exact commit that is deployed**, then look the names up in the build manifest:
+
+  ```bash
+  cd qwik-guvi && npm run build
+  node -e "const m=require('./dist/q-manifest.json'); for (const n of process.argv.slice(1)) console.log(n, JSON.stringify(m.bundles[n]?.origins ?? 'not in this build'))" q-BCYPl1tV.js q-D31wtCEL.js
+  ```
+
+- "Not in this build" means the local build does not match the deployed one. Do not guess from a mismatched manifest.
+- The origins name the source files. The fix is import timing (SOP §8): the code in that bundle should not load until it is used.
+
+#### 8. Desktop is a target too
+
+`config/targets.json` has desktop budgets, and the SOP's bar is 90+ on both. A mobile fix can regress desktop — a preload without a `media` query makes desktop download the mobile hero. Once mobile meets its target, run `--strategy desktop` before reporting DONE, and treat a desktop failure as the next iteration.
 
 ### Step 4 — Read the SOP, then map the insight to an allowed action
 
@@ -174,7 +323,7 @@ Then, for the insight you picked, find the action it maps to:
 | `bootup-time`, `mainthread-work-breakdown`, `long-tasks` | Expensive JS | §8 dynamic-import heavy libs at point of use, §8 no new packages without senior approval |
 | `duplicated-javascript-insight`, `legacy-javascript-insight` | Bundle bloat | §10.3 no new packages / never change dependency versions |
 | `font-display-insight` | Invisible text while fonts load | §6 fonts (update `@font-face` **and** every preload together), §5 typography |
-| `third-parties-insight` | Third-party cost | Usually **not yours** — document it, do not attempt it |
+| `third-parties-insight` | Other people's code, **except** rows on hosts in `PSI_FIRST_PARTY_HOSTS` | Document vendor rows; work owned-host rows as image or script findings |
 | `cls-culprits-insight`, `cumulative-layout-shift` | Layout shift | §5 spacing, §7 never Store static arrays, images need dimensions |
 | `forced-reflow-insight` | Synchronous layout thrash | §7 no `useVisibleTask$` on first fold, §7 `noSerialize` for lib instances |
 | `cache-insight`, `document-latency-insight` | Headers / server latency | **Likely outside the frontend.** If the SOP does not cover it, stop and ask. Note `document-latency-insight` often carries a large estimate with zero items — it is unattributed, so `--party first` will not filter it out. Judge it by whether the number is plausible against the real LCP, not by the estimate. |
@@ -514,6 +663,7 @@ This records the device emulation, CPU benchmark, locale and categories the run 
 - Budget explicitly: a 10-iteration loop with a 10-run baseline and a 10-run re-measure per iteration is **~200 units**. Know your daily cap before you start.
 - `PSI_CONCURRENCY` (default 10) controls how many calls are in flight per report, so a 10-run check goes out in one round. It does not change the quota cost — 10 runs is 10 units at any concurrency. Leave it at 10, and do not run two reports at once: the limit is per report, so overlapping runs double the load on the staging origin.
 - **Only compare reports taken at the same concurrency.** Ten simultaneous page loads can raise the origin's TTFB, and with it FCP and LCP, compared with staggered runs. A baseline taken at concurrency 2 is not a valid comparison for a re-measure at 10 — re-take the baseline.
+- `PSI_FIRST_PARTY_HOSTS` lists other domains the site owns, comma-separated (`guvi.in,guvi.co`). Without it, `static.guvi.in` is filed as third party and `--diagnose` tells you not to touch 800 KB of the site's own images. Confirm it is set before you build a work queue. `--reanalyze` re-classifies stored reports against today's list at no quota cost.
 - **Re-filter with `--reportId`, never re-run.** Changing a filter is free:
   ```bash
   npm run psi -- --reportId <id> --metric tbt --group diagnostic
@@ -810,7 +960,12 @@ curl http://127.0.0.1:3939/health
 
 - [ ] `sop-qwik.md` read in full this session
 - [ ] Baseline and re-measurement both free of the "same analysis timestamp" cache warning
-- [ ] Work queue built with `--party first`, and every chosen insight grepped to a real file
+- [ ] Work queue built with `--diagnose --party first`
+- [ ] IMAGE CHECKS read; `fine` oversized rows left alone
+- [ ] `--items` opened for the chosen insight, and every chosen finding grepped to a real file
+- [ ] `--requests` checked for heavy images and unexpected third-party hosts
+- [ ] `PSI_FIRST_PARTY_HOSTS` includes `guvi.in,guvi.co`, so `static.guvi.in` is treated as ours
+- [ ] Lazy-loading: IMAGE CHECKS plus a browser pass at 412 × 823 for CSS backgrounds (Step 3d, playbook 3)
 - [ ] Third-party findings logged as "not actionable in repo", not attempted
 - [ ] Every change maps to an action the SOP allows
 - [ ] No raw `<img>` introduced; no existing `object-fit` changed; no Figma asset swapped for an icon
@@ -825,6 +980,7 @@ curl http://127.0.0.1:3939/health
 - [ ] Waited a flat 10 minutes, then polled every 60s until the deploy settled
 - [ ] Confirmed the new build hash is being served, not a stale edge
 - [ ] Re-measured with 10 runs
+- [ ] Desktop measured once mobile met its target, and it meets its own target
 - [ ] Improvement beat the baseline `stddev`, or the change was reverted
 - [ ] `optimization-log.md` appended
 - [ ] `psi-api/` untouched

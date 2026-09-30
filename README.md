@@ -46,6 +46,7 @@ Without a key, PSI falls back to a shared anonymous quota that is **frequently a
 | `PORT` | `3939` | HTTP port. |
 | `HOST` | `127.0.0.1` | Bind address. |
 | `PSI_CONCURRENCY` | `10` | Concurrent PSI calls per report (capped at 10). Quota is per run, not per concurrent call. Use `2` without an API key. |
+| `PSI_FIRST_PARTY_HOSTS` | *(unset)* | Extra domains the measured site owns, comma-separated (`guvi.in,guvi.co`). Without this, a CDN on a sister host is filed as third-party. |
 | `LOG_LEVEL` | `info` | Pino log level for the server. |
 | `PSI_DATA_DIR` | `./data` | Where reports are written. |
 
@@ -275,7 +276,9 @@ Runs the same core code as the server, so no server is needed.
 | `--order <asc\|desc>` | `desc` | |
 | `--party <any\|first\|third>` | `any` | Whose cost counts. See below. |
 | `--minFirstPartyRatio <n>` | — | Keep only insights that are at least this fraction yours. |
-| `--diagnose` | off | Print the ranked work queue, the LCP element, and the cautions. |
+| `--diagnose` | off | Print the ranked work queue, the LCP element, image checks, and the cautions. |
+| `--items <list>` | — | Print every row of these insight ids (URLs, elements, snippets). |
+| `--requests [start\|size]` | — | Print every request the median run made. Honours `--party` and `--limit`. |
 | `--limit <n>` | — | |
 | `--noFlaky` | — | Hide insights seen in <30% of runs. |
 | `--json` | off | Machine-readable output. |
@@ -291,6 +294,10 @@ npm run psi -- --reportId 2026-09-29T10-30-00Z-mobile --metric tbt --noFlaky
 
 # the ranked work queue for a report you already paid for - also free
 npm run psi -- --reportId 2026-09-29T10-30-00Z-mobile --diagnose --party first
+
+# the rows of one insight, and the request table
+npm run psi -- --reportId 2026-09-29T10-30-00Z-mobile --items image-delivery-insight
+npm run psi -- --reportId 2026-09-29T10-30-00Z-mobile --requests size --limit 20
 
 # upgrade stored reports written by older aggregation rules - free
 npm run psi -- --reanalyze --no-save
@@ -338,7 +345,7 @@ Rows are sorted by `--sortBy` (default `savingsMs`, largest first). Ties and row
 
 If any runs failed, a yellow `N run(s) failed:` block lists up to three of them. The last line is the `reportId` to pass to `--reportId` for free re-filtering.
 
-`--diagnose` replaces FINDINGS with the ranked work queue, the LCP element and the cautions described under [`GET /report/:reportId/diagnosis`](#get-reportreportiddiagnosis); the metric table there shows only failing targets. Colour is on when stdout is a terminal; `NO_COLOR` turns it off and `FORCE_COLOR=1` forces it on.
+`--diagnose` replaces FINDINGS with the ranked work queue, the LCP element, IMAGE CHECKS, and the cautions described under [`GET /report/:reportId/diagnosis`](#get-reportreportiddiagnosis); the metric table there shows only failing targets. `--items` and `--requests` print the rows of named insights and the median run's request table. Colour is on when stdout is a terminal; `NO_COLOR` turns it off and `FORCE_COLOR=1` forces it on.
 
 ### `--reanalyze`: rebuilding stored reports for free
 
@@ -493,7 +500,7 @@ So every insight now carries ownership:
 
 `firstPartyShare` is `0`–`1`, or `null` when the cost could not be attributed to a host at all. It is the share of *items*, not of bytes — an item is the unit Lighthouse's own audits report in.
 
-Hosts come from `items[].url` and nested `items[].subItems.items[].url`. A host is **first party** if it equals the measured domain or is a subdomain of it — `media.example.com` counts as yours when you measured `www.example.com`, because you own the fix even though the bytes cross a CDN.
+Hosts come from `items[].url` and nested `items[].subItems.items[].url`. A host is **first party** if it equals the measured domain, is a subdomain of it, or is listed in `PSI_FIRST_PARTY_HOSTS`. `media.example.com` counts as yours when you measured `www.example.com`; `static.guvi.in` counts as yours when `PSI_FIRST_PARTY_HOSTS=guvi.in`. Without that list, a CDN on a sister domain is filed as third-party cost.
 
 Use it as a filter:
 
@@ -513,9 +520,9 @@ npm run psi -- <url> --party third
 - `party=third` is the inverse, for auditing third-party cost deliberately.
 - `minFirstPartyRatio` is the explicit middle ground, for when a small first-party share is not enough to justify the work.
 
-`third-parties-insight` is treated as third party by definition, since every row in it is someone else's code. `--diagnose` reports such findings rather than hiding them — they must be logged as "not actionable in repo" — but demotes them to the bottom of the queue, because a finding you cannot fix is not work.
+`third-parties-insight` lists every entity other than the measured host. A row is third party unless **every** resource in it sits on a domain the site owns (`PSI_FIRST_PARTY_HOSTS`). `--diagnose` still reports wholly-third-party findings so they can be logged as "not actionable in repo", but demotes them to the bottom of the queue. Rows on owned hosts are routed as image or script work.
 
-`third-parties-insight` is treated as third party by definition, since every row in it is someone else's code. For each resource under `subItems`, we attach:
+For each resource under `subItems`, we attach:
 
 - `resourceType` — `Script`, `Image`, `Stylesheet`, `Font`, etc., read from Lighthouse's own network request log.
 - `node` — selector and snippet, **when Lighthouse already flagged that resource in an element-level audit** (render-blocking scripts, mis-sized images). If Lighthouse never recorded a selector, this field is absent and you must grep for the URL yourself.
