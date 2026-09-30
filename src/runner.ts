@@ -13,7 +13,7 @@ import { makeReportId, saveReport } from './storage.js';
 
 export const MAX_RUNS = 25;
 export const DEFAULT_RUNS = 10;
-export const DEFAULT_CONCURRENCY = 2;
+export const DEFAULT_CONCURRENCY = 10;
 
 export interface RunnerOptions {
   url: string;

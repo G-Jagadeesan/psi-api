@@ -74,6 +74,15 @@ describe('targetBar', () => {
     expect(bar.tick).toBe('┃');
   });
 
+  it('crosses the marker for a value only just past target', () => {
+    // Speed index at 101%: the fill rounds to the marker's own cell, which used
+    // to draw the "not reached" line on a red, over-target row.
+    const bar = targetBar(3439, 3400, WIDTH);
+    expect(bar.over).toBe(true);
+    expect(bar.tick).toBe('×');
+    expect(visibleLength(bar.fill + bar.lead + bar.tick + bar.rest)).toBe(WIDTH);
+  });
+
   it('never marks a metric with no target as breached', () => {
     // No target means no line to cross, so the cross glyph would be a claim the
     // data does not support.

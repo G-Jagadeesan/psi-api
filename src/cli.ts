@@ -507,10 +507,10 @@ const BUDGET_COLUMNS: Column[] = [
   { key: 'metric', label: 'METRIC', min: 11 },
   { key: 'actual', label: 'MEDIAN', align: 'right', min: 8 },
   { key: 'target', label: 'TARGET', align: 'right', min: 8 },
-  { key: 'used', label: 'OF TARGET', align: 'right', min: 10 },
   { key: 'delta', label: 'VERDICT', min: 13 },
-  { key: 'pass', label: 'RUNS IN TARGET', align: 'right', min: 15 },
+  { key: 'used', label: '% OF TARGET', align: 'right', min: 10 },
   { key: 'bar', label: '', min: 16, max: 16 },
+  { key: 'pass', label: 'RUNS IN TARGET', align: 'right', min: 15 },
 ];
 
 /**
@@ -565,12 +565,12 @@ function budgetCells(
       over ? paint('red', entry.label, useColor) : entry.label,
       metricValue(entry.key, actual),
       gap ? metricValue(entry.key, gap.target) : ABSENT,
+      gap ? paint(over ? 'red' : 'green', metricDelta(entry.key, gap.delta), useColor) : ABSENT,
       // The share is the number the bar is drawn from, so it is printed rather
       // than left for the reader to infer from block characters.
       gap ? paint(over ? 'red' : 'dim', `${Math.round(bar.used * 100)}%`, useColor) : ABSENT,
-      gap ? paint(over ? 'red' : 'green', metricDelta(entry.key, gap.delta), useColor) : ABSENT,
-      gap ? paint(passSeverity(gap), passCount(gap), useColor) : ABSENT,
       barText,
+      gap ? paint(passSeverity(gap), passCount(gap), useColor) : ABSENT,
     ];
   });
 }

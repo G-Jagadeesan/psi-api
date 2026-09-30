@@ -512,7 +512,8 @@ This records the device emulation, CPU benchmark, locale and categories the run 
 
 - **Always set `PSI_API_KEY`.** Without one you share a tiny anonymous quota that is usually already exhausted.
 - Budget explicitly: a 10-iteration loop with a 10-run baseline and a 10-run re-measure per iteration is **~200 units**. Know your daily cap before you start.
-- `PSI_CONCURRENCY` (default 2) controls how many calls are in flight. Higher is not faster overall — PSI is server-side bound, and you risk rate limiting. Leave it at 2.
+- `PSI_CONCURRENCY` (default 10) controls how many calls are in flight per report, so a 10-run check goes out in one round. It does not change the quota cost — 10 runs is 10 units at any concurrency. Leave it at 10, and do not run two reports at once: the limit is per report, so overlapping runs double the load on the staging origin.
+- **Only compare reports taken at the same concurrency.** Ten simultaneous page loads can raise the origin's TTFB, and with it FCP and LCP, compared with staggered runs. A baseline taken at concurrency 2 is not a valid comparison for a re-measure at 10 — re-take the baseline.
 - **Re-filter with `--reportId`, never re-run.** Changing a filter is free:
   ```bash
   npm run psi -- --reportId <id> --metric tbt --group diagnostic

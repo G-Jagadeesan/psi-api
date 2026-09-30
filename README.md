@@ -45,7 +45,7 @@ Without a key, PSI falls back to a shared anonymous quota that is **frequently a
 | `PSI_API_KEY` | *(unset)* | Google PSI key. Optional but strongly recommended. |
 | `PORT` | `3939` | HTTP port. |
 | `HOST` | `127.0.0.1` | Bind address. |
-| `PSI_CONCURRENCY` | `2` | Concurrent PSI calls (capped at 10). Each call costs quota. |
+| `PSI_CONCURRENCY` | `10` | Concurrent PSI calls per report (capped at 10). Quota is per run, not per concurrent call. Use `2` without an API key. |
 | `LOG_LEVEL` | `info` | Pino log level for the server. |
 | `PSI_DATA_DIR` | `./data` | Where reports are written. |
 
@@ -66,20 +66,44 @@ npm run --silent psi -- https://example.com --group opportunity,diagnostic --max
 > The URL has to be reachable **from Google's public cloud**, not just from your machine. `https://www.guvi.co/` and `https://www.guin.com/` both currently return `FAILED_DOCUMENT_REQUEST` on every run for that reason, so neither is usable as a measurement target until it is publicly reachable.
 
 ```
-https://www.guvi.co/  [mobile]
-score 58.0/100  (median of 10/10 runs)
-LCP 3210ms!  TBT 90ms  CLS 0.020  FCP 1234ms  SI 3810ms
-spread: score stddev 4.2 · values 55, 57, 58, 58, 59, 61, 52, 60, 58, 56
-BELOW TARGET  score +1  lcp +710
+run 6/10  score 95
+run 5/10  score 95
+run 2/10  score 95
+...
+run 3/10  score 95
 
-INSIGHTS (3 of 19)
-  SAVING   ID                                      GROUP        METRIC    ITEMS
-  1200ms   uses-responsive-images                  opportunity  lcp       1
-  640ms    render-blocking-resources               opportunity  fcp,lcp   2
-  380ms    unused-javascript                       opportunity  lcp       1
+https://qwik-guvi-perf-fix.codingpuppet.com/zen-class/
+mobile · Lighthouse 13.5.0 · median of 10/10 runs · 2026-09-30
+measured under moto g power (2022) · CPU index 843 (higher = slower) · en-US · performance only
 
-reportId 2026-09-29T10-30-00Z-mobile
+SCORE    95 / 100  target 90   p25 95 · p75 95 · p95 95 · range 94–95 · stddev 0.4
+
+VERDICT  PASS  2 of 6 targets failing
+        FCP 1991ms vs 1800ms (0/10 runs in target), SI 3427ms vs 3400ms (4/10 runs in target)
+
+  METRIC       MEDIAN  TARGET  VERDICT      % OF TARGET                    RUNS IN TARGET
+  FCP          1991ms  1800ms  +191ms over         111%  ████████×·······            0/10
+  LCP          2476ms  2500ms  in target            99%  ████████┃·······            9/10
+  Speed index  3427ms  3400ms  +27ms over          101%  ████████×·······            4/10
+  TBT             8ms   200ms  in target             4%  ········┃·······           10/10
+  CLS           0.000   0.100  in target             0%  ········┃·······           10/10
+
+FINDINGS  32 shown
+  EST. SAVING  INSIGHT                          AFFECTS  OURS   SEEN
+        559ms  render-blocking-insight          LCP FCP  100%  10/10
+        225ms  image-delivery-insight           LCP FCP     —  10/10
+        150ms  cache-insight                    LCP FCP    0%  10/10
+            —  bootup-time                      TBT      100%  10/10
+         84KB  unused-javascript                LCP FCP  100%  10/10
+  ...
+
+  — in SAVING means Lighthouse gave no estimate, which is not zero.
+  OURS is how much of the cost your own code is responsible for.
+
+saved as reportId 2026-09-30T08-04-23Z-mobile
 ```
+
+Every part of this is explained in [Reading the output](#reading-the-output).
 
 ---
 
@@ -276,6 +300,46 @@ Filters compose with `--reportId`, so narrowing a work queue after a 10-run base
 
 **Use `--diagnose --party first` when building a work queue.** `--diagnose` ranks findings by how they bear on the metrics that are actually failing, instead of leaving you to infer that from a flat savings sort.
 
+### Reading the output
+
+The default view, top to bottom. The sample in [Quick start](#quick-start) shows each part.
+
+**Progress lines** (stderr, only when PSI is actually run). One `run N/10  score S` line per run as it finishes. Runs execute concurrently (`PSI_CONCURRENCY`), so they arrive out of order — the number is the run's slot, not its finishing position. A failed run prints `run N/10  FAILED  <reason>`, and a retry prints `retry: <reason> (<delay>ms)`. Warnings such as the [PSI cache](#psi-caches-per-url) warning are printed after the last run.
+
+**Header.** The measured URL (without the cache-busting nonce), then `strategy · Lighthouse version · <stat> of <succeeded>/<requested> runs · date`, then the [measured under](#the-measured-under-line) line.
+
+**SCORE.** The headline score (the chosen `--stat`, median by default), its target, then the spread across runs: `p25`, `p75`, `p95`, `range` (min–max) and `stddev`. The score is green at 90+, yellow at 50–89 and red below 50, matching Lighthouse's own bands. When the score is [bimodal](#bimodality) a yellow line under it describes the two groups.
+
+**VERDICT.** `N of M targets failing` counts every target in `config/targets.json` for the strategy — the score plus the five metrics in the table. A target fails when fewer than 90% of runs hold it, not only when the median misses (see [A budget is graded on the tail](#a-budget-is-graded-on-the-tail-not-the-median)). The word is `FAIL` only when **more than half** the targets fail, so `PASS  2 of 6 targets failing` is a mostly-healthy page that still has work to do; `meetsTarget` in the JSON is the strict all-targets verdict. The line under it names up to four failing targets, worst relative overshoot first, with how many runs held each. Two optional yellow lines can follow: one when every median is in target but the tail is not, and `not fixable from here: …` for a [budget the frontend cannot meet](#budgets-the-frontend-cannot-meet).
+
+**Metric table.** One row per graded metric (FCP, LCP, Speed index, TBT, CLS). The score has no row; it is on the SCORE line.
+
+| Column | Meaning |
+| --- | --- |
+| `METRIC` | Red when the median is over its target. |
+| `MEDIAN` | The headline statistic for this metric (median unless `--stat` says otherwise). |
+| `TARGET` | The budget from `config/targets.json`. |
+| `VERDICT` | Where the median sits: `+Nms over` (red) or `in target` (green). Judged on the median only — the tail is the last column. |
+| `% OF TARGET` | Median as a share of the budget. `100%` is exactly on it; red when over. |
+| bar | The same share, drawn. The bar spans 0–200% of the target in 16 cells, so the marker sits in the same column on every row. `┃` is a target not reached, `×` is a target passed. The glyph carries the verdict without colour, for output pasted where ANSI is stripped. Values past 200% are clamped. |
+| `RUNS IN TARGET` | How many individual runs held the budget. Green when the target passes (90%+ of runs); yellow when at least 70% of runs held it, or when the median is in target but too many runs missed; red otherwise. |
+
+**FINDINGS.** Every normalized Lighthouse audit that survives the filters (all of them by default, including the metric audits such as `first-contentful-paint`, which carry no saving). `N shown` becomes `N of M shown` when filters or `--limit` hide some.
+
+| Column | Meaning |
+| --- | --- |
+| `EST. SAVING` | Lighthouse's estimated saving in ms, or in bytes (`84KB`) when it gave only a byte figure. `—` means no estimate, which is [not the same as zero](#no-estimate-is-not-zero). |
+| `INSIGHT` | The audit id. A yellow `(flaky)` suffix means it appeared in under 30% of runs. |
+| `AFFECTS` | The metrics Lighthouse says the audit bears on. `—` when it names none. |
+| `OURS` | The share of the cost on [first-party](#first-party-vs-third-party) hosts: green `100%`, yellow when mixed, dim `0%` when wholly third party, `—` when Lighthouse gave no URLs to attribute. |
+| `SEEN` | Runs the audit appeared in, out of successful runs. |
+
+Rows are sorted by `--sortBy` (default `savingsMs`, largest first). Ties and rows with no value for the sort field sort to the end in id order — so a finding priced only in bytes, like `unused-javascript` above, sits among the `—` rows under the default sort. Use `--sortBy savingsBytes` to rank those.
+
+If any runs failed, a yellow `N run(s) failed:` block lists up to three of them. The last line is the `reportId` to pass to `--reportId` for free re-filtering.
+
+`--diagnose` replaces FINDINGS with the ranked work queue, the LCP element and the cautions described under [`GET /report/:reportId/diagnosis`](#get-reportreportiddiagnosis); the metric table there shows only failing targets. Colour is on when stdout is a terminal; `NO_COLOR` turns it off and `FORCE_COLOR=1` forces it on.
+
 ### `--reanalyze`: rebuilding stored reports for free
 
 A stored `report.json` is a frozen snapshot of whatever the aggregation rules produced on the day it was written, so improving those rules does nothing for the history. `--reanalyze` re-derives each report from its own stored runs, which costs no PSI quota:
@@ -327,7 +391,7 @@ Every metric and the score are reported with all three statistics plus the raw v
 - **`stddev` is the sample standard deviation (n−1)** and doubles as the noise band: an improvement smaller than roughly one `stddev` is not distinguishable from run-to-run variance.
 - **`p25` / `p75` / `p95`** are the tail percentiles (`PERCENTILE.INC`). A budget describes real sessions rather than the middle of a distribution, so the p75 is often the number that predicts what a user actually sees. They are the right thing to compare when deciding whether a change helped.
 - **`distributions.<metric>` reports bimodality.** If `bimodal` is `true`, the samples split into two genuinely different states and the median sits in one of them by run count, not because the page reliably performs there. See below.
-- Runs execute with bounded concurrency (`PSI_CONCURRENCY`, default 2). Some runs may fail; the run continues and the result reports `runsRequested` vs `runsSucceeded`. **If fewer than 60% of runs succeed the whole call fails** with `INSUFFICIENT_RUNS` rather than reporting a misleading number.
+- Runs execute with bounded concurrency (`PSI_CONCURRENCY`, default 10, so a 10-run report goes out in one round and takes about as long as its slowest run). The limit is per report: two reports running at once put twice as many calls in flight. Compare reports only against baselines taken at the same concurrency, since a burst of simultaneous loads can raise the origin's TTFB. Some runs may fail; the run continues and the result reports `runsRequested` vs `runsSucceeded`. **If fewer than 60% of runs succeed the whole call fails** with `INSUFFICIENT_RUNS` rather than reporting a misleading number.
 
 #### Bimodality
 
@@ -635,7 +699,7 @@ The public `guvi-guvi` SOP sets the real bar: **Lighthouse 90+ minimum, 95+ best
 ## Development
 
 ```bash
-npm test          # 173 unit tests, no network
+npm test          # unit tests, no network
 npm run typecheck # tsc over src and tests
 npm run dev       # watch mode
 npm run build     # emit dist/
@@ -655,7 +719,7 @@ To regenerate the fixture: `node scripts/make-fixture.js`.
 | `INSUFFICIENT_RUNS` | Fewer than 60% of runs returned data. | Check the `errors` array; usually quota or timeouts. |
 | `FAILED_DOCUMENT_REQUEST` on **every** run | Lighthouse loads the page from Google's public cloud and could not reach it — the host is down, blocking Google, or not publicly reachable. | Open the URL in a browser, then check it resolves publicly. A URL that works locally can still fail here. This is not a tool bug and retrying will not help. |
 | Score `0` with a tiny `fetchTime` | The URL is `localhost`/private, so Lighthouse measured an error page. | Measure a deployed public URL. The tool warns about this up front. |
-| Report takes minutes | Each run is a real PSI call; 10 runs at concurrency 2 takes a while. | Use `?async=true`, or `runs=3` while iterating. |
+| Report takes minutes | Each run is a real PSI call, and a report waits for its slowest run. | Check `PSI_CONCURRENCY` is not set low in `.env`. Use `?async=true`, or `runs=3` while iterating. |
 | Every insight shows `-` savings | Unexpected for Lighthouse 10.4+; those versions report `metricSavings`. | Should not happen — `metricSavings` is read as a fallback. If it does, the response shape has changed and the tool needs a look. |
 | `stddev 0.0`, every value identical | Either PSI served one cached report for all runs, or the page is pinned well inside the "good" band. | Read the warnings. If it says "same analysis timestamp", the runs were cached — re-measure. If there is no warning, the page is genuinely stable; check the metric values to see the real spread. |
 | Site breaks when a query string is added | Cache busting appends `?psi_nonce=…` to the measured URL. | Rare, but real for strict routers. Use `cacheBust: false` in library code, or confirm the site is measured correctly. |

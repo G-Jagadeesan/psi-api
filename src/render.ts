@@ -396,14 +396,18 @@ export function targetBar(
   }
 
   const mark = Math.min(width - 1, Math.floor((1 / scale) * width));
-  const covered = Math.round(clamp(used / scale, 0, 1) * width);
   const over = used > 1;
+  // Rounding alone can land a value just past target on the marker's own cell
+  // (101% of 16 cells is 8.08), so the over/under decision comes from `used`
+  // and the fill is pushed to the correct side of the marker.
+  const rounded = Math.round(clamp(used / scale, 0, 1) * width);
+  const covered = over ? Math.max(rounded, mark + 1) : Math.min(rounded, mark);
 
   // The marker occupies one of the `width` positions, so the value gets the
   // other `width - 1`. When the value runs past the marker that means one fewer
   // filled cell than its own length - the marker sits *on top of* the fill rather
   // than beside it, which is the whole visual point of an over-target bar.
-  if (covered > mark) {
+  if (over) {
     return {
       fill: '█'.repeat(mark),
       lead: '█'.repeat(covered - mark - 1),
@@ -528,13 +532,19 @@ export function passCount(gap: {
  * Red is reserved for the case worth stopping work over: a third or more of real
  * sessions missing the target. Between the graded threshold and that, the honest
  * signal is "mostly holding, watch it".
+ *
+ * A median inside target caps the colour at yellow, so the row never shows red
+ * next to "in target". The tail miss is still flagged, and the pass-rate gate
+ * still fails the target.
  */
 export function passSeverity(gap: {
   meets: boolean;
   passRate?: number;
+  delta?: number;
 }): 'green' | 'yellow' | 'red' {
   if (gap.meets) return 'green';
   if (gap.passRate !== undefined && gap.passRate >= 0.7) return 'yellow';
+  if (gap.delta !== undefined && gap.delta <= 0) return 'yellow';
   return 'red';
 }
 

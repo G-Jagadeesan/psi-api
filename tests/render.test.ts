@@ -276,6 +276,12 @@ describe('passSeverity', () => {
     expect(passSeverity({ meets: true, passRate: 1 })).toBe('green');
   });
 
+  it('never paints red when the median is inside target', () => {
+    // LCP 2476ms vs 2500ms, held in 6/10 runs.
+    expect(passSeverity({ meets: false, passRate: 0.6, delta: -24 })).toBe('yellow');
+    expect(passSeverity({ meets: false, passRate: 0.6, delta: 39 })).toBe('red');
+  });
+
   it('assumes the worst when the pass rate was never measured', () => {
     // An absent pass rate is not evidence of health, so it must not read green.
     expect(passSeverity({ meets: false })).toBe('red');
