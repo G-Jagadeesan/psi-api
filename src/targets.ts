@@ -64,11 +64,30 @@ export function medianMeets(gap: Gap): boolean {
 }
 
 /**
+ * Metrics measured as elapsed time from navigation start, and which therefore
+ * cannot be shorter than the server round trip.
+ *
+ * This set is deliberately narrow. TBT, INP and CLS are *not* bounded by TTFB:
+ * TBT accumulates main-thread blocking time, INP measures interaction latency,
+ * and CLS is unitless, so a slow server does not raise their floors. Applying a
+ * TTFB floor to TBT produced the nonsensical conclusion that a 200ms blocking
+ * budget was unreachable because the server took 562ms to respond - a statement
+ * about two unrelated quantities.
+ */
+const TTFB_FLOORED_METRICS = new Set(['fcp', 'lcp', 'speedIndex', 'tti']);
+
+/**
  * Which gaps cannot be closed by frontend work at all.
  *
- * When TTFB alone already meets or exceeds a budget, no component change can get
- * that metric under it. Saying so lets the optimization loop escalate instead of
- * spending every remaining iteration on a number it structurally cannot reach.
+ * When the server round trip alone already meets or exceeds an elapsed-time
+ * budget, no component change can get that metric under it. Saying so lets the
+ * optimization loop escalate instead of spending every remaining iteration on a
+ * number it structurally cannot reach.
+ *
+ * Only a metric whose *median* is over budget qualifies. A metric that clears
+ * its budget on the median and misses it on a couple of runs is a variance
+ * problem to be stabilised, not a structural ceiling - calling that unreachable
+ * would be an excuse to stop working on something that is genuinely fixable.
  */
 export function blockedByPlatform(report: Pick<AggregatedReport, 'headline' | 'metrics'>, gaps: Gap[]): string[] {
   const reasons: string[] = [];
@@ -76,9 +95,9 @@ export function blockedByPlatform(report: Pick<AggregatedReport, 'headline' | 'm
   if (typeof ttfb !== 'number' || !Number.isFinite(ttfb)) return reasons;
 
   for (const gap of gaps) {
-    if (gap.meets) continue;
-    // CLS is unitless, so a millisecond floor cannot apply to it.
-    if (!LOWER_IS_BETTER.has(gap.metric) || gap.metric === 'cls') continue;
+    if (!TTFB_FLOORED_METRICS.has(gap.metric)) continue;
+    // The median must actually be over budget, not merely some of the runs.
+    if (medianMeets(gap)) continue;
     if (ttfb >= gap.target - EPSILON) {
       reasons.push(
         `${gap.metric}: TTFB alone is ${Math.round(ttfb)}ms against a ${gap.target}ms budget, so no ` +

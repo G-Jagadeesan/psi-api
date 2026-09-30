@@ -270,4 +270,26 @@ describe('hand-built insights', () => {
     const report = { ...PASSING, insights: [insight('bare')] };
     expect(() => rankInsights(report)).not.toThrow();
   });
+
+  it('applies its own group default when the caller does not ask for one', () => {
+    // The default lived in the CLI renderer, so the HTTP endpoint fell back to
+    // "no group filter" and let `passed` audits into the queue - a bootup-time
+    // audit Lighthouse considers fine then outranked a 601ms diagnostic just for
+    // nominally touching an unstable metric. The queue must not depend on the
+    // surface that asked for it.
+    const report = { ...PASSING, insights: [insight('passed-one', { group: 'passed', savingsMs: 400 })] };
+    expect(rankInsights(report).map((entry) => entry.insight.id)).not.toContain('passed-one');
+    expect(
+      rankInsights(report, { filters: { group: ['passed'] } }).map((entry) => entry.insight.id),
+    ).toContain('passed-one');
+  });
+
+  it('produces the same queue with or without an explicit group filter', () => {
+    const report = build({ lcp: 4000, tbt: 100, cls: 0.01, fcp: 1500, speedIndex: 3000 });
+    const implicit = rankInsights(report).map((entry) => entry.insight.id);
+    const explicit = rankInsights(report, {
+      filters: { group: ['opportunity', 'diagnostic'] },
+    }).map((entry) => entry.insight.id);
+    expect(implicit).toEqual(explicit);
+  });
 });

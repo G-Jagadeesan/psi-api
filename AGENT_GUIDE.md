@@ -52,22 +52,56 @@ If `meetsTarget` is `true`, **stop.** Report success with before/after numbers. 
 If `meetsTarget` is `false`, read `targets.gaps` to see exactly which metric is over budget:
 
 ```
-BELOW TARGET  score -63 lcp +13570 tbt +1927
+METRICS OVER BUDGET
+  FCP 2154 vs 1800 (+354)  pass 0%
+  SI 3222 vs 3400 (-178)  pass 70%
+  TBT 118 vs 200 (-82)  pass 80%
 ```
 
 `+` means over budget. Work the worst one first, weighted by what Lighthouse says it costs.
 
+**A gap now carries a pass rate, and it is the number to trust.** Each gap reports `passRate`, `overBudgetRuns` and `runsMeasured` alongside the median. A budget describes real sessions, not the middle of a distribution, so a metric is graded on how often individual runs land inside it — at least 90% by default.
+
+This distinction catches a real failure mode. In the report above, TBT's median is 118 ms against a 200 ms budget, so a median-only check calls it a comfortable pass — but 2 of 10 runs came in at 270 ms and 423 ms, and those over-budget runs are precisely the ones dragging the score down. `meets` is `false`, `medianPass` is `true`, and the gap is reported as failing.
+
+When `medianPass` is `true` but `meetsTarget` is `false`, say so in your report rather than reporting a pass. `diagnosis.unreliable` names the metrics where the median and the tail disagree.
+
+**Some gaps are not yours to close.** When a budget sits below what the server round trip alone already costs, `targets.blockedBy` says so. The tool applies this only to elapsed-time metrics (`fcp`, `lcp`, `speedIndex`, `tti`) and only when the *median* is over budget — TBT, INP and CLS are not bounded by TTFB, and a metric that misses on a couple of runs is a variance problem, not a ceiling. If a metric is listed there, escalate rather than spending iterations on it.
+
 ### Step 3 — Build the work queue
+
+Use `--diagnose`. It ranks the queue against the metrics that are actually failing, prints the LCP element and its phase split, and lists the cautions that change how the numbers should be read. Do not hand-assemble this from the flat insight table — the flat table answers "what did Lighthouse find", not "what should I work on".
+
+```bash
+npm run psi -- --reportId <reportId> --diagnose --party first
+```
+
+Over HTTP, for the ranked queue on its own:
+
+```bash
+curl "localhost:3000/report/<reportId>/diagnosis?party=first"
+```
+
+For the plain filtered table, when you need it:
 
 ```bash
 npm run psi -- --reportId <reportId> \
-  --group opportunity,diagnostic --maxScore 0.9 \
+  --group opportunity,diagnostic \
   --party first --sortBy savingsMs --limit 10
 ```
 
 Using `--reportId` re-filters the report you already paid for. **Never re-run PSI just to change a filter** — each run is a quota unit and several minutes of wall clock.
 
-**`--party first` is not optional.** Without it the queue fills up with other people's code. On this project's own deployed page the two highest-saving actionable findings were both `static.cloudflareinsights.com` — Cloudflare's analytics beacon — which no edit to the repo can fix. `--party first` drops anything charged to a foreign host while keeping unattributed findings like main-thread breakdowns, which are usually your own JavaScript. Check third-party cost separately with `--party third`, and log it; do not attempt it.
+**`--party first` keeps mixed findings.** It drops an insight only when *all* of its cost is somebody else's, and keeps findings Lighthouse could not attribute to a URL at all — a main-thread breakdown with no script behind it is usually your own JavaScript.
+
+The previous behaviour dropped any insight with a single foreign-host row, which discarded real first-party cost. On this project's deployed page, `unused-css-rules` held 43,098 bytes of the site's own dead CSS (94% of the finding) plus one gstatic reCAPTCHA stylesheet — and the whole finding vanished from the queue because of that one row. That is precisely the case where you own most of the fix.
+
+Each insight reports `firstPartyShare` (0–1, or `null` when unattributed). Use it to judge ownership explicitly:
+
+- `--party first` — drop only wholly-foreign findings. The default choice.
+- `--minFirstPartyRatio 0.5` — additionally require at least half the cost to be yours.
+
+Check third-party cost separately with `--party third`, and log it; do not attempt it.
 
 **Some findings have no savings estimate at all.** `savingsMs: null` means Lighthouse did not estimate one, which is different from `0` (estimated as worthless). Checklist-style insights such as `lcp-discovery-insight` report a real failure with no time figure, and they sort last as unknown. To surface them deliberately:
 
@@ -77,15 +111,53 @@ npm run psi -- --reportId <reportId> --group diagnostic --maxScore 0.9 --sortBy 
 
 Add `--metric lcp` / `tbt` / `cls` to focus on the metric that is actually failing, and `--noFlaky` to drop intermittent findings.
 
-**Prioritize like this:**
+**Prioritize like this.** The tool already does this in `--diagnose`; the rules are listed so you can check its work:
 
-1. The metric that is failing, in this order: **LCP → TBT → CLS → score**.
-2. Within it, the largest `savingsMs` first.
-3. `flaky: true` insights (seen in under 30% of runs) go to the bottom — they are usually a third party you do not control.
-4. A `diagnostic` with a large saving beats an `opportunity` with a small one.
+1. Metrics that are failing, worst relative overshoot first. Compare each overshoot to *its own budget*, so a 400 ms LCP miss on a 2500 ms budget outranks a 3-point score miss on a 90-point target.
+2. Within a metric, findings that affect it at all, then the largest `savingsMs`.
+3. First-party cost. A wholly-third-party finding is reported, not hidden, so you can log it as "not actionable in repo" — but it must not be worked.
+4. `flaky: true` insights (seen in under 30% of runs) go to the bottom — a finding you cannot reproduce cannot be validated by re-measurement.
 5. `savingsMs: null` means "no estimate", not "no gain". A failing insight with a null estimate can still be the right thing to fix — do not skip it just because it sorts low.
+6. The score is never a target in its own right. It is a composite that inherits from the Core Web Vitals; optimise the underlying metric, never the score.
 
-**Verify the number, and verify the ownership, before you commit to a fix.** Lighthouse savings are estimates and routinely disagree with reality — a "1.2 s LCP saving" on a page whose LCP is 16 s is a rounding error, not a win. **Rank by what moves the failing metric, not by the raw saving.** And confirm the insight is first-party: check `itemHosts`, `firstPartyItems` and `thirdPartyItems` on the insight before you read any source code.
+> **FCP is a real target, and it is the one that fails most often.** The old priority order here started at LCP, but across this project's 20 stored mobile reports FCP failed 20/20 while LCP failed 11/20. FCP is a Core Web Vital and a ranking input, and on this page it is the binding constraint. Do not skip past it.
+
+**Verify the number, and verify the ownership, before you commit to a fix.** Lighthouse savings are estimates and routinely disagree with reality — a "1.2 s LCP saving" on a page whose LCP is 16 s is a rounding error, not a win. **Rank by what moves the failing metric, not by the raw saving.** And confirm the insight is first-party: check `itemHosts`, `firstPartyItems`, `thirdPartyItems` and `firstPartyShare` on the insight before you read any source code.
+
+### Step 3a — Check what the LCP element actually is
+
+Before applying any image advice, read `lcp` from the report (or the `LCP ELEMENT` block in `--diagnose`):
+
+```json
+{
+  "isText": true,
+  "phases": { "ttfb": 578.17, "renderDelay": 1083.34 },
+  "totalMs": 1662,
+  "dominantPhase": "renderDelay",
+  "bottleneck": "render"
+}
+```
+
+Two facts decide which playbook applies, and neither is visible in the LCP number:
+
+- **`isText`** — if the LCP element is a text node there is no image to prioritise, lazy-load or resize, so `lcp-discovery-insight`, `prioritize-lcp-image-insight` and `lcp-lazy-loaded-insight` do not apply to this page. On the deployed page the LCP element is a `<div>` of body copy, and `lcp-discovery-insight` is `notApplicable`.
+- **`bottleneck`** — `loadDelay`/`loadTime` means fetch earlier; `renderDelay` means something is blocking paint, usually CSS; `ttfb` means the server is the constraint and no component change will help.
+
+There is deliberately no load phase when the LCP element is text, because there is no resource to load. That absence is the finding.
+
+### Step 3b — Do not trust a savings figure of zero
+
+`savingsMs: 0` used to mean "zero" when it actually meant "Lighthouse wrote a rollup of zero and the tool stopped looking". The tool now falls through the rollup to the per-metric estimate, the per-row sum, and finally the display string, and records which one it used in `savingsSource` (`overall` | `metricSavings` | `items` | `displayValue` | `none`).
+
+So a cost that was being reported as nothing is now visible. On the deployed page the three largest findings all reported `0ms` before:
+
+| insight | was | actually | from |
+| --- | --- | --- | --- |
+| `render-blocking-insight` | 0 ms | 601 ms | `items` |
+| `unused-javascript` | 0 ms | 206 KiB | `displayValue` |
+| `image-delivery-insight` | 0 ms | 33 KiB | `displayValue` |
+
+Treat `none` as "Lighthouse gave no estimate", which is a different fact from "no gain" — and a real failure with no estimate can still be the right thing to fix.
 
 ### Step 4 — Read the SOP, then map the insight to an allowed action
 
@@ -329,7 +401,19 @@ Compare against the baseline:
 
 Use the **baseline's `stddev`** as the noise band — it is the same measurement setup that produced the number you are comparing to. Note that `stddev` shrinks as the median climbs; recompute the band from the most recent report each time.
 
-Also check the target metric you were actually fixing, not just the score. A change that trades LCP for CLS may leave the score flat while making things worse for users.
+**But judge the change on the metric's own spread, not the score's.** The score is a composite: it moves when any input moves, so `score.stddev` is a band built from every metric at once. A report on this project's deployed page had an LCP `stddev` of `0.0` (2401 ms in all 10 runs) next to a score `stddev` of 3.37. Using the score's spread as the band for an LCP change demands a margin the LCP cannot ever produce, and a genuine 500 ms LCP win gets filed as "inconclusive".
+
+Every metric now reports `p25`, `p75` and `p95` alongside its `stddev`, and `distributions.<metric>` reports whether the samples are bimodal. Judge the change you made against **the distribution of the metric you changed**:
+
+| Change to | Judge on |
+| --- | --- |
+| LCP or FCP | `metrics.lcp.p75 - baseline.metrics.lcp.p75`, and `metrics.lcp.stddev` |
+| TBT | `metrics.tbt.p75` and `passRate`, not the score |
+| CSS/JS weight | `distributions.score` and the score's `p75` |
+
+**A bimodal metric is not one population, so its `stddev` is not a noise band.** If `distributions.score.bimodal` is `true`, the page has two distinct states — on this project's page the scores cluster at 87.5–88.5 and 93–95.5. Averaging those gives a spread that describes neither state. Read the two lanes separately, work out which lane the change moved, and only compare within a lane. `--diagnose` prints this as a caution.
+
+Also check the target metric you were actually fixing, not just the score. A change that trades LCP for CLS may leave the score flat while making things worse for users. And re-check `passRate`: a change that pulls one over-budget run back inside the budget is worth keeping even when the median does not move.
 
 ### Step 10 — Log it
 
@@ -391,6 +475,8 @@ Loop from Step 2. Stop when `meetsTarget` is `true`, or when you hit the iterati
 
 **When to use mode.** The most frequently observed bucket, after bucketing (score to 1 point, time metrics to 100 ms, CLS to 0.01). Read it as "what this page typically scores". It is a good sanity check: if `mode` and `median` disagree wildly, the page is bimodal — usually one flaky third party — and you should look at the raw `values` array before trusting either.
 
+**Bimodality is reported, not left to be guessed.** `distributions.<metric>` carries `bimodal`, both `lanes`, their `separation`, and a human-readable `note`. The detection splits the samples at the point that minimises within-lane spread (Otsu's method in 1D) and only claims two populations when both lanes hold at least 20% of the samples, there are at least 6 samples in total, and the lane means are far enough apart to be more than jitter. A single bad run among nine good ones is reported as ordinary spread, not as a second mode. When `bimodal` is `true`, the median is a number between two real states and means less than either of them.
+
 **What `flaky: true` means.** The insight appeared in fewer than 30% of successful runs. It is intermittent. Deprioritize it: a flaky finding may not reproduce when you re-measure, so you cannot tell your fix from the noise. If a flaky insight is enormous, check whether a third party is involved before touching anything.
 
 **Accepting a change.** Require the improvement to exceed roughly one `stddev` of the baseline. If it does not, the honest answer is "inconclusive", not "small win". Re-measure once to break the tie; if still inconclusive, revert and note it in the log. Small real wins are still real — but you cannot distinguish them from noise, and shipping a change you cannot measure is how regressions accumulate.
@@ -413,6 +499,13 @@ Loop from Step 2. Stop when `meetsTarget` is `true`, or when you hit the iterati
   ```bash
   npm run psi -- --reportId <id> --metric tbt --group diagnostic
   ```
+- **Rebuild old reports for free with `--reanalyze`.** A stored `report.json` is a snapshot of whatever the aggregation rules produced on the day it was written, so improving the rules does nothing for history. `--reanalyze` re-derives the report from its own retained runs, costing no quota:
+  ```bash
+  npm run psi -- --reanalyze                 # every stored report on disk
+  npm run psi -- --reanalyze --reportId <id> # just one
+  npm run psi -- --reanalyze --no-save       # preview the changes, write nothing
+  ```
+  It reports what each rebuild changed — cost figures recovered, phantom zeroes corrected, and the set of failing metrics before and after. A rebuilt report only *fills in* a savings figure that was missing; a figure Lighthouse already gave is never overwritten with a rougher row-derived approximation. `runs.json` is left untouched, so a rebuild can always be redone.
 - A report is cached for 10 minutes server-side; pass `force=true` only when you genuinely need a fresh measurement.
 - If you see `429`, stop and report it. Do not retry in a loop and do not fall back to `runs=1` pretending that is a valid baseline.
 - `INSUFFICIENT_RUNS` means fewer than 60% of runs returned data. The result is discarded on purpose — a median of 2 runs out of 10 is not a measurement. Check the `errors` array.
@@ -491,6 +584,8 @@ curl "http://127.0.0.1:3939/report/2026-09-29T05-45-30Z-mobile/insights?group=op
       "displayValue": "Est savings of 11,289 KiB",
       "savingsMs": 6550,
       "savingsBytes": 11520018,
+      "savingsSource": "overall",
+      "firstPartyShare": 1,
       "metricsAffected": ["lcp", "fcp"],
       "appearedInRuns": 10,
       "runsSucceeded": 10,
@@ -502,7 +597,71 @@ curl "http://127.0.0.1:3939/report/2026-09-29T05-45-30Z-mobile/insights?group=op
 }
 ```
 
-### 5.3 `POST /insights` — run and filter in one call
+`savingsSource` says where the figure came from: `overall` (Lighthouse's own rollup), `metricSavings` (its per-metric time impact), `items` (the per-row sum), or `displayValue` (parsed out of the human-readable string). `firstPartyShare` is `0`–`1`, or `null` when the cost could not be attributed to a host at all.
+
+### 5.3 `GET /report/:reportId/diagnosis` — the ranked work queue
+
+```bash
+curl "http://127.0.0.1:3939/report/2026-09-30T03-46-50Z-mobile/diagnosis?party=first"
+```
+
+```json
+{
+  "reportId": "2026-09-30T03-46-50Z-mobile",
+  "headline": { "score": 94, "metrics": { "lcp": 2401, "tbt": 117.5, "cls": 0, "fcp": 2153.8 } },
+  "targets": { "meetsTarget": false, "medianPass": true, "gaps": [], "blockedBy": [] },
+  "lcp": {
+    "isText": true,
+    "phases": { "ttfb": 578.17, "renderDelay": 1083.34 },
+    "totalMs": 1662,
+    "dominantPhase": "renderDelay",
+    "bottleneck": "render"
+  },
+  "distributions": { "score": { "bimodal": true, "lanes": [] } },
+  "priorityOrder": [ { "metric": "fcp", "actual": 2153.78, "target": 1800, "delta": 353.78, "passRate": 0, "meets": false } ],
+  "primary": { "metric": "fcp", "actual": 2153.78, "target": 1800, "passRate": 0 },
+  "ranked": [
+    {
+      "rank": 1,
+      "insight": { "id": "render-blocking-insight", "savingsMs": 601, "savingsSource": "items", "firstPartyShare": 1 },
+      "sop": { "sop": "§6/§8", "action": "Inline critical CSS or defer the rest; ship no JS on first fold" },
+      "affectsFailing": ["fcp"],
+      "thirdPartyOnly": false,
+      "estimateFromText": false,
+      "reason": "affects failing FCP; 100% first-party; 601ms est. saving"
+    }
+  ],
+  "blocked": [],
+  "unreliable": [ { "metric": "tbt", "passRate": 0.8, "overBudgetRuns": 2, "runsMeasured": 10 } ],
+  "cautions": ["FCP reads as failing on 0% of runs ..."],
+  "exhausted": false
+}
+```
+
+Read it in this order: `primary` tells you the metric to work on, `ranked` is the queue, `unreliable` and `cautions` tell you which numbers not to over-read, and `exhausted` is `true` when the failing metrics have no first-party work left against them — stop and escalate rather than burning another iteration.
+
+The same queue is produced by `npm run psi -- --reportId <id> --diagnose`. Both surfaces read the same code path, so the ranking cannot diverge between them.
+
+### 5.4 `npm run psi -- --reanalyze` — rebuild stored reports for free
+
+```bash
+npm run psi -- --reanalyze --no-save
+```
+
+```
+RE-ANALYZED 27 stored report(s), 25 with a changed conclusion, 68 cost figure(s) recovered, 373 phantom zero(es) corrected
+  2026-09-30T04-17-57Z-mobile       same (not saved)
+  2026-09-30T03-50-24Z-mobile       changed (not saved)
+      render-blocking-insight: was 0, actually 601ms (from items)
+      16 finding(s) claimed 0ms where Lighthouse gave no estimate
+  2026-09-30T03-53-46Z-mobile       changed (not saved)
+      unused-javascript: was 0, actually 1050ms (from items)
+      failing: [fcp lcp] -> [fcp lcp speedIndex tbt]
+```
+
+Two different corrections are reported separately, and the distinction matters: a **recovered** figure is a real cost the tool had been hiding, while a **phantom zero** is a stored `0` that claimed an estimate of zero where Lighthouse gave none — it is corrected to `null`, not counted as a win. Drop `--no-save` to write the rebuilt reports back.
+
+### 5.5 `POST /insights` — run and filter in one call
 
 ```bash
 curl -X POST http://127.0.0.1:3939/insights \
@@ -513,13 +672,13 @@ curl -X POST http://127.0.0.1:3939/insights \
 
 Returns the same shape as 5.2, with `headline` and `targets` from a fresh 10-run report.
 
-### 5.4 `GET /health`
+### 5.6 `GET /health`
 
 ```json
 { "status": "ok", "uptimeSeconds": 42, "apiKeyConfigured": true, "cacheEntries": 1, "activeJobs": 0 }
 ```
 
-### 5.5 CLI — baseline, then a free re-filter
+### 5.7 CLI — baseline, then a free re-filter
 
 ```bash
 # costs 10 units
@@ -530,11 +689,11 @@ npm run psi -- https://www.guvi.co/ --runs 10 --stat median --strategy mobile
 https://www.guvi.co/  [mobile]
 score 27/100  (median of 10/10 runs)
 LCP 16070ms!  TBT 2127ms!  CLS 0.000   FCP 7332ms!  SI 13287ms!
-spread: score stddev 2.1 · values 27, 26, 24, 28, 29, 27, 31, 25, 28, 30
-BELOW TARGET  score -63 lcp +13570 tbt +1927 fcp +5532 speedIndex +9887
+spread: score p25 25 p75 29 p95 33.55 · stddev 2.9
+BELOW TARGET  score -63 (0% of runs in budget) lcp +13570 (0% of runs in budget) tbt +1927 (0% of runs in budget) fcp +5532 (0% of runs in budget) speedIndex +9887 (0% of runs in budget)
 
 INSIGHTS (6 of 32)
-  SAVING   ID                        GROUP        METRIC   ITEMS
+  SAVING   ID                        GROUP          METRIC     ITEMS
   6550ms   cache-insight             diagnostic   lcp,fcp  99
   1960ms   unused-javascript         opportunity  lcp,fcp  22
   1200ms   image-delivery-insight    diagnostic   lcp,fcp  5
@@ -545,6 +704,8 @@ INSIGHTS (6 of 32)
 reportId 2026-09-29T05-45-30Z-mobile
 ```
 
+The pass rate appears next to every failing gap, and the spread line reports the tail percentiles rather than just `stddev`. Add `--diagnose` for the ranked queue, the LCP element, and the cautions.
+
 ```bash
 # costs nothing - same stored report, TBT focus, flaky hidden, JSON out
 npm run --silent psi -- --reportId 2026-09-29T05-45-30Z-mobile \
@@ -554,10 +715,11 @@ npm run --silent psi -- --reportId 2026-09-29T05-45-30Z-mobile \
 > Use `npm run --silent psi --` for anything you pipe or parse. Plain `npm run psi` prints npm's `> psi-api@1.0.0 psi` banner to **stdout**, which corrupts `--json` output. Human-readable output does not need it.
 
 Useful flags: `--strategy desktop`, `--stat mean`, `--limit N`, `--search "third-party"`,
-`--minSavingsMs 500`, `--id lcp-discovery-insight,image-delivery-insight`, `--no-save`, `--help`.
+`--minSavingsMs 500`, `--minFirstPartyRatio 0.5`, `--sortBy firstPartyShare`,
+`--id lcp-discovery-insight,image-delivery-insight`, `--no-save`, `--reanalyze`, `--help`.
 Exit code is `0` on success and `1` on error.
 
-### 5.6 GitHub — find the staging PR and poll it
+### 5.8 GitHub — find the staging PR and poll it
 
 Verified against `guvi-geek/qwik-guvi` on 2026-09-29, branch `perf-fix`:
 
@@ -571,7 +733,7 @@ $ gh run list --branch perf-fix --limit 3
 
 So on this repo the staging PR number is discoverable, and the poll loop runs, but there is nothing for GitHub Actions to report. The build is CodeBuild via `buildspec.yml`. The agent's fallback is to poll the staging URL's build hash each minute, and to ask a human which pipeline the branch triggers.
 
-### 5.7 Why one push per settled build
+### 5.9 Why one push per settled build
 
 A correct timeline, and the mistake next to it:
 
@@ -601,7 +763,9 @@ The second timeline costs nothing but waiting. The first one can take staging do
 ```bash
 cd psi-api
 npm run psi -- <url> --runs 10 --stat median --strategy mobile   # baseline
+npm run psi -- --reportId <id> --diagnose --party first          # the ranked work queue
 npm run psi -- --reportId <id> --metric lcp --sortBy savingsMs   # free re-filter
+npm run psi -- --reanalyze --no-save                              # rebuild stored reports, free
 npm run --silent psi -- --reportId <id> --metric tbt --noFlaky --json  # machine output
 npm test                                                          # the tool's own tests
 ```

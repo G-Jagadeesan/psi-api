@@ -214,17 +214,16 @@ export function rankInsights(
   // (a 9.7ms third-party beacon, for one), so a `maxScore` filter would hide
   // exactly the findings the queue needs in order to rule them out.
   //
-  // Metric gating is applied below rather than through `filterInsights`, because
-  // it needs a rule the shared filter does not have: an insight with *unknown*
-  // metric attribution is kept, not dropped. `metricsAffected` is derived from
-  // Lighthouse's `metricSavings`/`relevantAudits`, which plenty of audits never
-  // populate - main-thread breakdowns, LCP phase tables, third-party cost. A
-  // shared `metric` filter silently deletes all of them, and those are exactly
-  // the findings that explain a metric that is failing.
+  // The group default lives here rather than in each caller. When it lived in
+  // the CLI renderer, the HTTP endpoint silently defaulted to "no group filter"
+  // and let `passed` audits into the queue - so a bootup-time audit that
+  // Lighthouse considers fine outranked a 601ms render-blocking diagnostic,
+  // purely because it nominally touched an unstable metric. The work queue must
+  // not depend on which surface asked for it.
   const candidates = filterInsights(report.insights, {
-    group: ['opportunity', 'diagnostic'],
     includeFlaky: false,
     ...options.filters,
+    group: options.filters?.group ?? ['opportunity', 'diagnostic'],
   }).filter((insight) => {
     // A metric audit is the failing number restated, not a cause of it, and it
     // has no playbook to route to. The gap list already says it is over budget.

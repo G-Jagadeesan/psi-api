@@ -158,9 +158,53 @@ describe('platform-blocked metrics', () => {
     expect(reasons).toEqual([]);
   });
 
+  it('does not treat TBT as bounded by the server round trip', () => {
+    // TBT accumulates main-thread blocking time, not elapsed time. A 562ms TTFB
+    // against a 200ms blocking budget says nothing about whether TBT is
+    // reachable, and concluding otherwise is a statement about two unrelated
+    // quantities.
+    const reasons = blockedByPlatform(
+      { headline: { score: 90, metrics: {} }, metrics: { ttfb: seriesStats([562], 'ttfb') } },
+      [{ metric: 'tbt', actual: 300, target: 200, delta: 100, meets: false }],
+    );
+    expect(reasons).toEqual([]);
+  });
+
+  it('does the same for INP and for the score', () => {
+    for (const metric of ['inp', 'score']) {
+      const reasons = blockedByPlatform(
+        { headline: { score: 80, metrics: {} }, metrics: { ttfb: seriesStats([900], 'ttfb') } },
+        [{ metric, actual: 500, target: 200, delta: 300, meets: false }],
+      );
+      expect(reasons).toEqual([]);
+    }
+  });
+
+  it('does not call a metric unreachable when only the tail misses', () => {
+    // The median is inside budget, so this is variance to stabilise rather than
+    // a structural ceiling. Declaring it unreachable would excuse skipping work
+    // that genuinely can be done.
+    const reasons = blockedByPlatform(
+      { headline: { score: 90, metrics: {} }, metrics: { ttfb: seriesStats([562], 'ttfb') } },
+      [{ metric: 'fcp', actual: 1700, target: 1800, delta: -100, meets: false }],
+    );
+    expect(reasons).toEqual([]);
+  });
+
+  it('still flags a genuinely unreachable elapsed-time budget', () => {
+    const reasons = blockedByPlatform(
+      { headline: { score: 90, metrics: {} }, metrics: { ttfb: seriesStats([2000], 'ttfb') } },
+      [{ metric: 'fcp', actual: 2400, target: 1800, delta: 600, meets: false }],
+    );
+    expect(reasons[0]).toMatch(/fcp/);
+  });
+
   it('surfaces the reason on the comparison', () => {
-    const report = aggregate({ lcp: [3200, 3200, 3200], ttfb: [2800, 2800, 2800] });
-    expect(report.targets.blockedBy?.[0]).toMatch(/fcp|lcp/);
+    const report = aggregate({ lcp: [3200, 3200, 3200], fcp: [3000, 3000, 3000], ttfb: [2800, 2800, 2800] });
+    // Only the elapsed-time metrics are named; a 2800ms TTFB says nothing about
+    // TBT, CLS or the score.
+    expect(report.targets.blockedBy?.join(' ')).toMatch(/fcp/);
+    expect(report.targets.blockedBy?.join(' ')).not.toMatch(/tbt/);
   });
 
   it('says nothing when TTFB was not measured', () => {

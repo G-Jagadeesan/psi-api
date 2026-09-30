@@ -1,4 +1,4 @@
-import { mkdir, readFile, readdir, writeFile } from 'node:fs/promises';
+import { mkdir, readFile, readdir, stat, writeFile } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 import type { AggregatedReport, NormalizedReport, Strategy } from './types.js';

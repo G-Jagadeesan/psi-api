@@ -141,9 +141,10 @@ Filters a stored report. Every parameter is optional and they all combine.
 | `search` | Case-insensitive substring of audit id or title. |
 | `id` | Exact audit ids, comma-separated. |
 | `hasItems` | `true` = only audits carrying a `details.items` list. |
-| `sortBy` | `savingsMs` (default), `savingsBytes`, `score`. |
+| `sortBy` | `savingsMs` (default), `savingsBytes`, `score`, `firstPartyShare`. |
 | `order` | `desc` (default) or `asc`. |
 | `party` | `any` (default), `first`, `third`. See below. |
+| `minFirstPartyRatio` | `0`–`1`. Keep only insights whose `firstPartyShare` is at least this. |
 | `limit` | Max results. |
 | `includeFlaky` | `true` (default). `false` hides insights seen in <30% of runs. |
 
@@ -153,6 +154,9 @@ curl "http://127.0.0.1:3939/report/$ID/insights?group=opportunity,diagnostic&max
 
 # everything that could save at least 100ms, cheapest first
 curl "http://127.0.0.1:3939/report/$ID/insights?minSavingsMs=100&order=asc"
+
+# mostly your own cost, ranked by how much of it is yours
+curl "http://127.0.0.1:3939/report/$ID/insights?minFirstPartyRatio=0.5&sortBy=firstPartyShare"
 ```
 
 The response carries the headline numbers and target verdict alongside the filtered list, so one call is usually enough:
@@ -161,12 +165,39 @@ The response carries the headline numbers and target verdict alongside the filte
 {
   "reportId": "2026-09-29T10-30-00Z-mobile",
   "headline": { "score": 58, "metrics": { "lcp": 3210, "tbt": 90 } },
-  "targets": { "meetsTarget": false, "gaps": [ { "metric": "lcp", "actual": 3210, "target": 2500, "delta": 710, "meets": false } ] },
+  "targets": {
+    "meetsTarget": false,
+    "medianPass": true,
+    "gaps": [ { "metric": "lcp", "actual": 3210, "target": 2500, "delta": 710, "passRate": 0.8, "overBudgetRuns": 2, "runsMeasured": 10, "p75": 3400, "p95": 3900, "meets": false } ],
+    "blockedBy": []
+  },
+  "lcp": { "isText": true, "phases": {}, "bottleneck": "render" },
+  "distributions": { "score": { "bimodal": false } },
   "totalInsights": 19,
   "matched": 3,
   "insights": [ /* ... */ ]
 }
 ```
+
+### `GET /report/:reportId/diagnosis`
+
+The ranked work queue. Where `/insights` answers "what did Lighthouse find", this answers "what should I work on": it orders findings by how they bear on the metrics that are actually failing, attaches the playbook route for each, and reports the things that would otherwise be over-read.
+
+```bash
+curl "http://127.0.0.1:3939/report/$ID/diagnosis?party=first"
+```
+
+| Field | |
+| --- | --- |
+| `priorityOrder` | Failing gaps, worst relative overshoot first. |
+| `primary` | The single metric to work on. |
+| `ranked` | The queue: each finding with its `sop` route, `affectsFailing`, `firstPartyShare`, `thirdPartyOnly` and a plain-English `reason`. |
+| `unreliable` | Metrics whose median is inside budget but whose runs are not — the false-PASS case. |
+| `blocked` | Budgets the server round trip makes unreachable. |
+| `cautions` | Everything that changes how the numbers should be read. |
+| `exhausted` | `true` when the failing metrics have no first-party work left against them. Stop and escalate. |
+
+`npm run psi -- --reportId <id> --diagnose` renders the same queue as text, through the same code path.
 
 ### `POST /insights`
 
@@ -204,6 +235,7 @@ Runs the same core code as the server, so no server is needed.
 | Option | Default | |
 | --- | --- | --- |
 | `--reportId <id>` | — | Re-filter a **stored** report. Costs no quota and runs no PSI calls. |
+| `--reanalyze` | off | Rebuild stored report(s) from their own retained runs with today's rules. Costs no quota. Combine with `--reportId`, or omit it to sweep everything in `data/`. |
 | `--runs <n>` | `10` | 1–25. |
 | `--stat <mean\|median\|mode>` | `median` | Headline statistic. |
 | `--strategy <mobile\|desktop>` | `mobile` | |
@@ -215,9 +247,11 @@ Runs the same core code as the server, so no server is needed.
 | `--search <text>` | — | Matches audit id or title. |
 | `--id <list>` | — | Exact ids. |
 | `--hasItems` / `--noItems` | — | Require / forbid a details item list. |
-| `--sortBy <savingsMs\|savingsBytes\|score>` | `savingsMs` | |
+| `--sortBy <savingsMs\|savingsBytes\|score\|firstPartyShare>` | `savingsMs` | |
 | `--order <asc\|desc>` | `desc` | |
 | `--party <any\|first\|third>` | `any` | Whose cost counts. See below. |
+| `--minFirstPartyRatio <n>` | — | Keep only insights that are at least this fraction yours. |
+| `--diagnose` | off | Print the ranked work queue, the LCP element, and the cautions. |
 | `--limit <n>` | — | |
 | `--noFlaky` | — | Hide insights seen in <30% of runs. |
 | `--json` | off | Machine-readable output. |
@@ -230,11 +264,34 @@ npm run psi -- https://example.com --search "third-party" --json
 
 # refine a report you already paid for - free, no PSI calls
 npm run psi -- --reportId 2026-09-29T10-30-00Z-mobile --metric tbt --noFlaky
+
+# the ranked work queue for a report you already paid for - also free
+npm run psi -- --reportId 2026-09-29T10-30-00Z-mobile --diagnose --party first
+
+# upgrade stored reports written by older aggregation rules - free
+npm run psi -- --reanalyze --no-save
 ```
 
 Filters compose with `--reportId`, so narrowing a work queue after a 10-run baseline never costs another quota unit.
 
-**Use `--party first` when building a work queue.** Without it the top of a savings sort is frequently third-party code you cannot fix in the repo.
+**Use `--diagnose --party first` when building a work queue.** `--diagnose` ranks findings by how they bear on the metrics that are actually failing, instead of leaving you to infer that from a flat savings sort.
+
+### `--reanalyze`: rebuilding stored reports for free
+
+A stored `report.json` is a frozen snapshot of whatever the aggregation rules produced on the day it was written, so improving those rules does nothing for the history. `--reanalyze` re-derives each report from its own stored runs, which costs no PSI quota:
+
+```
+RE-ANALYZED 27 stored report(s), 25 with a changed conclusion, 68 cost figure(s) recovered, 373 phantom zero(es) corrected
+  2026-09-30T03-50-24Z-mobile       changed (not saved)
+      render-blocking-insight: was 0, actually 601ms (from items)
+      16 finding(s) claimed 0ms where Lighthouse gave no estimate
+  2026-09-30T03-53-46Z-mobile       changed (not saved)
+      failing: [fcp lcp] -> [fcp lcp speedIndex tbt]
+```
+
+It reports two different corrections separately. A **recovered** figure is a real cost that a previous zero-rollup bug had been hiding. A **phantom zero** is a stored `0` that claimed an estimate of zero where Lighthouse gave none — corrected to `null`, and not counted as a win.
+
+A rebuild only ever *fills in* a missing savings figure. A figure Lighthouse already supplied is never overwritten, because it may have come from a rollup that does not survive normalization and cannot be reconstructed — replacing a precise number with a row-derived approximation would be a downgrade. `runs.json` is left untouched so a rebuild can always be redone.
 
 Exit code is `0` on success, `1` on error — so `npm run --silent psi -- <url> --runs 3 || echo "failed"` works in a script.
 
@@ -249,8 +306,12 @@ Every metric and the score are reported with all three statistics plus the raw v
   "headline": { "score": 58, "metrics": { "lcp": 3210 } },
   "score": {
     "mean": 57.6, "median": 58, "mode": 58,
-    "min": 52, "max": 61, "stddev": 3.1, "count": 10,
+    "min": 52, "max": 61, "stddev": 3.1, "p25": 55.25, "p75": 59.25, "p95": 60.45, "count": 10,
     "values": [55, 57, 58, 58, 59, 61, 52, 60, 58, 56]
+  },
+  "distributions": {
+    "score": { "bimodal": true, "lanes": [ { "min": 52, "max": 58, "mean": 56.1, "count": 5 }, { "min": 59, "max": 61, "mean": 60, "count": 5 } ] },
+    "lcp":   { "bimodal": false }
   },
   "stats": {
     "mean":   { "score": 57.6, "metrics": { "lcp": 3244 } },
@@ -264,7 +325,38 @@ Every metric and the score are reported with all three statistics plus the raw v
 - **`mean`** is pulled around by outliers. Useful only alongside `stddev` when you specifically care about the average user cost.
 - **`mode`** is the most frequently observed bucket. Read it as "what this page typically scores", not as a precise figure.
 - **`stddev` is the sample standard deviation (n−1)** and doubles as the noise band: an improvement smaller than roughly one `stddev` is not distinguishable from run-to-run variance.
+- **`p25` / `p75` / `p95`** are the tail percentiles (`PERCENTILE.INC`). A budget describes real sessions rather than the middle of a distribution, so the p75 is often the number that predicts what a user actually sees. They are the right thing to compare when deciding whether a change helped.
+- **`distributions.<metric>` reports bimodality.** If `bimodal` is `true`, the samples split into two genuinely different states and the median sits in one of them by run count, not because the page reliably performs there. See below.
 - Runs execute with bounded concurrency (`PSI_CONCURRENCY`, default 2). Some runs may fail; the run continues and the result reports `runsRequested` vs `runsSucceeded`. **If fewer than 60% of runs succeed the whole call fails** with `INSUFFICIENT_RUNS` rather than reporting a misleading number.
+
+#### Bimodality
+
+A page whose score splits into two clusters has no single meaningful `stddev` — averaging the lanes produces a spread that describes neither. The tool splits the samples at the point that minimises within-lane spread (Otsu's method in 1D) and reports `bimodal: true` only when all three hold:
+
+- both lanes hold at least **20%** of the samples,
+- there are at least **6** samples in total,
+- the lane means are far enough apart to be more than jitter (`separation` ≥ 4 — a uniform spread measures about 3.2, a real two-lane split about 8.0).
+
+A single bad run among nine good ones is therefore reported as ordinary spread, not as a second mode. When `bimodal` is `true`, compare within a lane, and work out which lane your change moved before accepting it.
+
+### The LCP element, not just the LCP number
+
+An aggregated report carries `lcp`, read from the run closest to the median:
+
+```json
+"lcp": {
+  "isText": true,
+  "phases": { "ttfb": 578.17, "renderDelay": 1083.34 },
+  "totalMs": 1662,
+  "dominantPhase": "renderDelay",
+  "bottleneck": "render"
+}
+```
+
+Two facts decide which playbook applies, and neither is visible in the LCP number alone:
+
+- **`isText`** — if the LCP element is a text node there is no image to prioritise, lazy-load or resize, so `lcp-discovery-insight`, `prioritize-lcp-image-insight` and `lcp-lazy-loaded-insight` do not apply. On a real deployment of this project the LCP element is a `<div>` of body copy, and `lcp-discovery-insight` is `notApplicable`. There is deliberately no load phase in that case, because there is no resource to load — the absence is the finding.
+- **`bottleneck`** — `loadDelay`/`loadTime` means fetch earlier; `renderDelay` means something is blocking paint, usually CSS; `ttfb` means the server is the constraint and no component change will help.
 
 ### PSI caches per URL
 
@@ -314,9 +406,12 @@ So every insight now carries ownership:
   "savingsMs": 150,
   "firstPartyItems": 0,
   "thirdPartyItems": 1,
+  "firstPartyShare": 0,
   "itemHosts": ["static.cloudflareinsights.com"]
 }
 ```
+
+`firstPartyShare` is `0`–`1`, or `null` when the cost could not be attributed to a host at all. It is the share of *items*, not of bytes — an item is the unit Lighthouse's own audits report in.
 
 Hosts come from `items[].url` and nested `items[].subItems.items[].url`. A host is **first party** if it equals the measured domain or is a subdomain of it — `media.example.com` counts as yours when you measured `www.example.com`, because you own the fix even though the bytes cross a CDN.
 
@@ -326,15 +421,19 @@ Use it as a filter:
 # the work queue: only what editing this repo could plausibly fix
 npm run psi -- <url> --group opportunity,diagnostic --maxScore 0.9 --party first
 
+# stricter: require at least half the cost to be yours
+npm run psi -- <url> --minFirstPartyRatio 0.5 --sortBy firstPartyShare
+
 # what the tag managers are costing you, kept out of the queue above
 npm run psi -- <url> --party third
 ```
 
-- `party=first` drops any insight charged to a foreign host. It **keeps** insights whose cost could not be attributed to a URL at all — main-thread breakdowns, LCP phase breakdowns. Those are usually your own JavaScript, and hiding them would hide the largest category of real work.
+- `party=first` drops an insight only when **all** of its cost is somebody else's (`thirdPartyItems > 0 && firstPartyItems === 0`). It **keeps** insights whose cost could not be attributed to a URL at all — main-thread breakdowns, LCP phase breakdowns. Those are usually your own JavaScript, and hiding them would hide the largest category of real work.
+- A **mixed** finding is kept, because you own part of the fix. The previous behaviour dropped any insight with a single foreign-host row, which discarded real cost: on a real deployment of this project `unused-css-rules` held 43,098 bytes of the site's own dead CSS — 94% of the finding — plus one gstatic reCAPTCHA stylesheet, and the entire finding vanished from the queue because of that one row.
 - `party=third` is the inverse, for auditing third-party cost deliberately.
-- An item loading from both your CDN and a vendor counts as first party: you own part of the cost and part of the fix.
+- `minFirstPartyRatio` is the explicit middle ground, for when a small first-party share is not enough to justify the work.
 
-`third-parties-insight` is treated as third party by definition, since every row in it is someone else's code.
+`third-parties-insight` is treated as third party by definition, since every row in it is someone else's code. `--diagnose` reports such findings rather than hiding them — they must be logged as "not actionable in repo" — but demotes them to the bottom of the queue, because a finding you cannot fix is not work.
 
 `third-parties-insight` is treated as third party by definition, since every row in it is someone else's code. For each resource under `subItems`, we attach:
 
@@ -394,17 +493,32 @@ Insights are merged across runs by audit id:
 
 ### How savings are read
 
-Lighthouse reports estimated savings in several shapes depending on version and audit, so each is read in turn and the first that yields a number wins:
+Lighthouse reports estimated savings in several shapes depending on version and audit, so each is read in turn and the **first non-zero** one wins:
 
 | Field | Used for |
 | --- | --- |
-| `details.overallSavingsMs` | Millisecond savings, when present. |
+| `details.overallSavingsMs` | Millisecond savings — Lighthouse's own rollup, the most authoritative figure available. |
 | `audit.metricSavings` | **Lighthouse 10.4+** drops `overallSavingsMs` and reports per-metric savings instead. The largest value is used. |
-| `details.items[].wastedMs` | Last resort — summed. |
-| `details.overallSavingsBytes` | Byte savings, when present. |
-| `details.items[].wastedBytes` | Summed otherwise. |
+| `details.items[].wastedMs` | Summed. |
+| `displayValue` ("Est savings of 1.2 s") | Parsed last. Requires the word "saving" *and* an explicit unit, so a string like "Main thread work: 1.1 s" cannot be mistaken for a saving. |
+| `details.overallSavingsBytes` | Byte savings — Lighthouse's own rollup. |
+| `details.items[].wastedBytes` | Summed. |
+| `displayValue` | Parsed last, for bytes. |
 
-This matters in practice: without the `metricSavings` fallback, a Lighthouse 13 report comes back with every insight showing `-` for savings and the sort order becomes meaningless. The `displayValue` string ("Est savings of 1.2 s") is also parsed as a last fallback.
+The source actually used is reported as `savingsSource`: `overall`, `metricSavings`, `items`, `displayValue`, or `none`.
+
+Two details here are deliberate and worth not undoing:
+
+- **"First non-zero", not "largest".** A rounded display string must never inflate an exact structured figure. `unused-css-rules` reports `overallSavingsBytes: 58008` and a display string of "Est savings of 58 KiB"; taking the largest would report 59392. Order of *precision* is the rule, not order of magnitude.
+- **Zero means "no estimate", not "no gain".** Lighthouse 13 writes `overallSavingsMs: 0` for audits that carry a real cost, and treating that `0` as an answer short-circuited the fallback chain before the per-row sum was ever reached. On a real deployment of this project the three largest findings all reported `0ms` because of it:
+
+| insight | reported | actually | from |
+| --- | --- | --- | --- |
+| `render-blocking-insight` | `0ms` | 601 ms | `items` |
+| `unused-javascript` | `0ms` | 206 KiB | `displayValue` |
+| `image-delivery-insight` | `0ms` | 33 KiB | `displayValue` |
+
+The highest `savingsMs` reported anywhere before the fix was 150 ms.
 
 ---
 
@@ -447,14 +561,38 @@ Every aggregated report includes:
   "strategy": "mobile",
   "targets": { "score": 90, "lcp": 2500, "...": 0 },
   "meetsTarget": false,
+  "medianPass": true,
   "gaps": [
-    { "metric": "lcp", "actual": 3210, "target": 2500, "delta": 710, "meets": false },
-    { "metric": "score", "actual": 58, "target": 90, "delta": -32, "meets": false }
-  ]
+    {
+      "metric": "tbt", "actual": 117.5, "target": 200, "delta": -82.5,
+      "passRate": 0.8, "overBudgetRuns": 2, "runsMeasured": 10,
+      "p75": 122, "p95": 423, "meets": false
+    }
+  ],
+  "blockedBy": []
 }
 ```
 
 `score` is the one metric where higher is better; everything else is a budget where lower is better. `meetsTarget` is `false` if **any** target metric is missed **or could not be measured** — an incomplete run never reports success.
+
+### A budget is graded on the tail, not the median
+
+A budget describes real sessions, not the middle of a distribution. Each gap is therefore graded on **how often individual runs land inside it**, and a gap fails when fewer than 90% of runs do (`DEFAULT_MIN_PASS_RATE`).
+
+This catches a real false-pass. In one report, per-run TBT was `110, 118, 270, 86, 118, 116, 423, 122, 107.5, 117` against a 200 ms budget. The median is 117.5, so a median-only check reports a comfortable pass — while 2 of 10 runs busted the budget at 270 ms and 423 ms, and those over-budget runs are exactly what users experience and what drags the score down. The gap reports `meets: false`, `passRate: 0.8`, and the report carries `medianPass: true` so both verdicts are visible.
+
+The pass-rate fields are **omitted entirely** when there is no per-run series to grade, so a single-run report or a hand-built aggregate keeps the original median-only behaviour. Pass-rate fields are also optional on the `Gap` type for the same reason.
+
+`medianPass` on the comparison answers "would this have passed on the median alone?", and `diagnosis.unreliable` names the metrics where the median and the tail disagree.
+
+### Budgets the frontend cannot meet
+
+`blockedBy` reports a budget that the server round trip alone already exceeds, so no component change can reach it. It applies **only** to elapsed-time metrics (`fcp`, `lcp`, `speedIndex`, `tti`) and **only** when the median is over budget:
+
+- TBT, INP and CLS are not bounded by TTFB. TBT accumulates main-thread blocking time, INP measures interaction latency, and CLS is unitless — applying a millisecond floor to them concludes things about two unrelated quantities.
+- A metric that clears its budget on the median and misses on a couple of runs is variance to stabilise, not a structural ceiling. Calling that unreachable would excuse skipping work that genuinely can be done.
+
+`worstGap` names the failing metric with the largest overshoot **relative to its own budget**, so a 400 ms LCP miss on a 2500 ms budget outranks a 3-point score miss on a 90-point target.
 
 ---
 
@@ -471,6 +609,8 @@ data/
 ```
 
 `<reportId>` is `<ISO timestamp>-<strategy>`, which sorts chronologically. `data/` and `.env` are gitignored.
+
+`report.json` is a snapshot of whatever the aggregation rules produced on the day it was written, so improving those rules does nothing for history. `runs.json` keeps the per-run detail — metrics, insights, items, display strings — which is what `--reanalyze` rebuilds from at no quota cost. A rebuild **only fills in** a missing savings figure: one that Lighthouse already supplied is never overwritten, because it may have come from a rollup that does not survive normalization and cannot be reconstructed. `runs.json` is never rewritten, so a rebuild can always be redone.
 
 The public `guvi-guvi` SOP sets the real bar: **Lighthouse 90+ minimum, 95+ best case, mobile and desktop.** The desktop thresholds above are the tighter interpretation of that; adjust both to match what you actually enforce.
 

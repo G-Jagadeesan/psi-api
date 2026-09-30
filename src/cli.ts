@@ -4,7 +4,8 @@ import { runReport, MAX_RUNS, InsufficientRunsError } from './runner.js';
 import { filterInsights } from './insights.js';
 import { diagnose as diagnoseReport, METRIC_LABELS } from './diagnose.js';
 import { loadTargets } from './targets.js';
-import { loadReport } from './storage.js';
+import { loadReport, loadRuns, listReports, getDataDir, saveReport } from './storage.js';
+import { diffReanalyzed, reanalyze, type ReanalyzeDelta } from './reanalyze.js';
 import { STATS, STRATEGIES, type AggregatedReport, type MetricKey, type SortField, type SortOrder } from './types.js';
 import type { FilterGroup, InsightFilters } from './types.js';
 import { UrlValidationError } from './psiClient.js';
@@ -19,6 +20,15 @@ const PARTIES = ['any', 'first', 'third'] as const;
 interface CliOptions {
   /** Re-filter an already stored report instead of spending more quota. */
   reportId?: string;
+  /**
+   * Rebuild stored report(s) from their stored runs with today's rules.
+   *
+   * A stored `report.json` freezes the conclusions of whatever aggregation code
+   * wrote it, so improving that code does nothing for the history. This
+   * recomputes a report from the retained per-run output, which upgrades
+   * historical findings without spending a single PSI request.
+   */
+  reanalyze: boolean;
   url: string;
   strategy: (typeof STRATEGIES)[number];
   runs: number;
@@ -65,9 +75,9 @@ Options:
   --hasItems              Only insights that carry a details item list
   --party <any|first|third>  Whose cost counts (default any)
                           first = keep everything you own any part of; drops ONLY
-                           findings that are entirely somebody else's cost. A mixed
-                           finding (your CSS + a vendor stylesheet) is KEPT - you
-                           still own most of that fix.
+                          findings that are entirely somebody else's cost. A mixed
+                          finding (your CSS + a vendor stylesheet) is KEPT - you
+                          still own most of that fix.
   --minFirstPartyRatio <n>  Keep insights whose cost is at least n yours (0-1)
   --sortBy <field>        savingsMs | savingsBytes | score | firstPartyShare
                            (default savingsMs)
@@ -76,6 +86,10 @@ Options:
   --noFlaky               Hide insights seen in fewer than 30% of runs
   --diagnose              Rank the work queue against the metrics that are
                            actually failing, and print the diagnosis
+  --reanalyze             Rebuild a stored report from its stored runs using
+                           today's aggregation and target rules. Costs no PSI
+                           quota. Combine with --reportId for one report, or
+                           omit it to sweep every stored report on disk.
   --json                  Machine-readable JSON
   --no-save               Do not write the report to data/
   -h, --help              This message
@@ -138,6 +152,7 @@ export function parseArgs(argv: string[]): CliOptions | null {
   let party: (typeof PARTIES)[number] = 'any';
   let minFirstPartyRatio: number | undefined;
   let diagnoseFlag = false;
+  let reanalyzeFlag = false;
   let sortBy: SortField = 'savingsMs';
   let order: SortOrder = 'desc';
   let limit: number | undefined;
@@ -235,6 +250,9 @@ export function parseArgs(argv: string[]): CliOptions | null {
       case '--diagnose':
         diagnoseFlag = true;
         break;
+      case '--reanalyze':
+        reanalyzeFlag = true;
+        break;
       case '--hasItems':
         hasItems = true;
         break;
@@ -279,7 +297,9 @@ export function parseArgs(argv: string[]): CliOptions | null {
   }
 
   const url = positional[0];
-  if (!url && !reportId) fail(`a url or --reportId is required\n${USAGE}`);
+  // A re-analysis reads reports from disk, so it needs neither a url nor an id:
+  // with no `--reportId` it sweeps everything stored.
+  if (!url && !reportId && !reanalyzeFlag) fail(`a url or --reportId is required\n${USAGE}`);
   if (url && positional.length > 1) fail(`unexpected argument "${positional[1]}"`);
   if (runs < 1 || runs > MAX_RUNS) fail(`--runs must be between 1 and ${MAX_RUNS}`);
 
@@ -306,6 +326,7 @@ export function parseArgs(argv: string[]): CliOptions | null {
     json,
     noSave,
     diagnose: diagnoseFlag,
+    reanalyze: reanalyzeFlag,
   };
 }
 
@@ -328,6 +349,12 @@ function scoreColor(score: number, useColor: boolean): string {
 
 function formatMs(value: number | undefined): string {
   return value === undefined ? '-' : `${Math.round(value)}ms`;
+}
+
+/** Round for display, dropping the float noise Lighthouse reports in. */
+function round(value: number, decimals: number): number {
+  const factor = 10 ** decimals;
+  return Math.round(value * factor) / factor;
 }
 
 function pad(value: string, width: number): string {
@@ -480,7 +507,8 @@ function renderDiagnosis(report: AggregatedReport, options: CliOptions): string 
   const useColor = process.stdout.isTTY === true && !process.env.NO_COLOR;
   const diagnosis = diagnoseReport(report, {
     filters: {
-      group: options.group ?? ['opportunity', 'diagnostic'],
+      // `group` is left to the diagnosis layer, which owns the default, so the
+      // queue is identical here and on the HTTP endpoint.
       party: options.party,
       minFirstPartyRatio: options.minFirstPartyRatio,
       sortBy: options.sortBy,
@@ -513,7 +541,14 @@ function renderDiagnosis(report: AggregatedReport, options: CliOptions): string 
     for (const gap of diagnosis.priorityOrder) {
       const label = METRIC_LABELS[gap.metric] ?? gap.metric.toUpperCase();
       const pct = gap.passRate === undefined ? '' : `  pass ${Math.round(gap.passRate * 100)}%`;
-      lines.push(`  ${color(RED, label, useColor)} ${gap.actual} vs ${gap.target} (${gap.delta > 0 ? '+' : ''}${gap.delta})${pct}`);
+      // Lighthouse reports fractional milliseconds; four decimal places is
+      // measurement noise that only makes two numbers hard to compare by eye.
+      const actual = round(gap.actual, gap.metric === 'cls' ? 3 : 0);
+      const target = round(gap.target, gap.metric === 'cls' ? 3 : 0);
+      const delta = round(gap.delta, gap.metric === 'cls' ? 3 : 0);
+      lines.push(
+        `  ${color(RED, label, useColor)} ${actual} vs ${target} (${delta > 0 ? '+' : ''}${delta})${pct}`,
+      );
     }
   }
 
@@ -605,6 +640,131 @@ async function loadStoredReport(reportId: string): Promise<AggregatedReport> {
   return report;
 }
 
+/**
+ * Upgrade stored report(s) from their own retained runs, at zero PSI cost.
+ *
+ * Writes the rebuilt report back over the stored one, but only after reporting
+ * what changed, so an upgrade is auditable rather than a silent rewrite. The
+ * `runs.json` beside it is left untouched: it is the evidence the rebuild was
+ * derived from, and rewriting it would destroy the ability to re-derive again.
+ */
+async function runReanalyze(options: CliOptions): Promise<number> {
+  const useColor = process.stdout.isTTY === true && !process.env.NO_COLOR;
+  const targets = loadTargets();
+
+  const reportIds = options.reportId
+    ? [options.reportId]
+    : (await listReports()).map((ref) => ref.reportId);
+
+  if (reportIds.length === 0) {
+    process.stderr.write('no stored reports found\n');
+    return 1;
+  }
+
+  const rows: Array<{
+    reportId: string;
+    delta: ReanalyzeDelta | null;
+    error?: string;
+    saved: boolean;
+  }> = [];
+
+  for (const reportId of reportIds) {
+    try {
+      const before = await loadReport(reportId);
+      const runs = await loadRuns(reportId);
+      if (!runs) {
+        rows.push({ reportId, delta: null, error: 'no stored runs', saved: false });
+        continue;
+      }
+      if (!before) {
+        rows.push({ reportId, delta: null, error: 'no stored report', saved: false });
+        continue;
+      }
+
+      const after = reanalyze(runs, {
+        reportId,
+        stat: before.stat,
+        runsRequested: before.runsRequested,
+        targets,
+      });
+      const delta = diffReanalyzed(before, after);
+
+      // Persist the upgraded report. The stored runs are deliberately left
+      // untouched: they are the evidence the rebuild was derived from, and
+      // rewriting them would destroy the ability to re-derive again.
+      let saved = false;
+      if (!options.noSave) {
+        await saveReport(after, runs, getDataDir());
+        saved = true;
+      }
+      rows.push({ reportId, delta, saved });
+    } catch (error) {
+      rows.push({
+        reportId,
+        delta: null,
+        error: error instanceof Error ? error.message : String(error),
+        saved: false,
+      });
+    }
+  }
+
+  if (options.json) {
+    process.stdout.write(`${JSON.stringify({ reanalyzed: rows }, null, 2)}\n`);
+    return rows.some((row) => row.error) ? 1 : 0;
+  }
+
+  const lines: string[] = [''];
+  const changed = rows.filter((row) => row.delta?.changed).length;
+  const totalRecovered = rows.reduce((sum, row) => sum + (row.delta?.recovered.length ?? 0), 0);
+  const totalPhantoms = rows.reduce((sum, row) => sum + (row.delta?.phantomZeroes.length ?? 0), 0);
+  lines.push(
+    `${color(BOLD, 'RE-ANALYZED', useColor)} ${rows.length} stored report(s), ` +
+      `${changed} with a changed conclusion, ${totalRecovered} cost figure(s) recovered, ` +
+      `${totalPhantoms} phantom zero(es) corrected`,
+  );
+  for (const row of rows) {
+    if (row.error) {
+      lines.push(`  ${color(RED, row.reportId, useColor)}  ${color(YELLOW, row.error, useColor)}`);
+      continue;
+    }
+    const delta = row.delta;
+    if (!delta) continue;
+    const mark = delta.changed ? color(YELLOW, 'changed', useColor) : color(DIM, 'same', useColor);
+    lines.push(`  ${pad(row.reportId, 34)}${mark}${row.saved ? '' : color(DIM, ' (not saved)', useColor)}`);
+    for (const change of delta.recovered) {
+      const ms = change.afterMs !== null ? `${change.afterMs}ms` : '-';
+      const bytes =
+        change.afterBytes !== change.beforeBytes
+          ? `, ${change.afterBytes ?? '-'} bytes`
+          : '';
+      lines.push(
+        color(
+          GREEN,
+          `      ${change.insightId}: was 0, actually ${ms}${bytes} (from ${change.source})`,
+          useColor,
+        ),
+      );
+    }
+    if (delta.phantomZeroes.length > 0) {
+      lines.push(
+        color(DIM, `      ${delta.phantomZeroes.length} finding(s) claimed 0ms where Lighthouse gave no estimate`, useColor),
+      );
+    }
+    if (delta.failingBefore.join(',') !== delta.failingAfter.join(',')) {
+      lines.push(
+        color(
+          DIM,
+          `      failing: [${delta.failingBefore.join(' ')}] -> [${delta.failingAfter.join(' ')}]`,
+          useColor,
+        ),
+      );
+    }
+  }
+  lines.push('');
+  process.stdout.write(`${lines.join('\n')}\n`);
+  return rows.some((row) => row.error) ? 1 : 0;
+}
+
 export async function main(argv = process.argv.slice(2)): Promise<number> {
   const options = parseArgs(argv);
   if (!options) {
@@ -613,6 +773,8 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
   }
 
   try {
+    if (options.reanalyze) return await runReanalyze(options);
+
     // Re-filtering a stored report costs no quota, so it short-circuits the run.
     const warnings: string[] = [];
     let report: AggregatedReport;

@@ -38,31 +38,55 @@ for (const key of METRIC_KEYS) {
 }
 
 /**
- * Recompute an already-stored insight's savings figure from what survived.
+ * Fill in a stored insight's savings figure when the stored one is missing.
  *
  * A stored `NormalizedReport` keeps `items` and `displayValue` but not the raw
  * `details` object, and the savings decision was baked in at normalize time.
  * Reports written before the zero-rollup fix therefore carry `savingsMs: 0` for
  * their largest findings, and no amount of re-aggregating will change that - the
- * number has to be derived again from the per-row `wastedMs`/`wastedBytes` and
+ * figure has to be derived again from the per-row `wastedMs`/`wastedBytes` and
  * the display string, which are both still on the record.
  *
- * This is what makes a stored report repairable without spending PSI quota.
+ * This only ever **fills a gap**. A stored positive figure is left exactly as it
+ * is, because it may have come from `details.overallSavingsMs` or
+ * `metricSavings` - neither of which survives normalization, so neither can be
+ * reconstructed here. Overwriting a known Lighthouse rollup with a row-derived
+ * approximation would trade a precise answer for a rough one, and reporting
+ * `null` for an estimate that already existed would be strictly worse than
+ * leaving the report alone. The zero-rollup defect is the only case worth
+ * repairing, and a stored `0` is unambiguous evidence of it.
  */
 export function refreshInsightSavings(insight: Insight): Insight {
-  const savings = savingsFromDetails(
+  const known = (value: number | null | undefined): boolean =>
+    typeof value === 'number' && value > 0;
+
+  if (known(insight.savingsMs) && known(insight.savingsBytes)) return insight;
+
+  const recomputed = savingsFromDetails(
     // The stored form has no `metricSavings`, so only the row and text sources
     // are available here. That is exactly what the real data needs.
     {} as RawAudit,
     { items: insight.items ?? [] },
     insight.displayValue,
   );
-  return {
-    ...insight,
-    savingsMs: savings.savingsMs,
-    savingsBytes: savings.savingsBytes,
-    savingsSource: savings.savingsSource,
-  };
+
+  const refreshed: Insight = { ...insight };
+  if (!known(insight.savingsMs)) {
+    // A stored `0` is the zero-rollup defect's fingerprint - the tool's own
+    // convention is that `null` means "no estimate" and `0` never reaches a
+    // normalized insight at all. So it is replaced, including by `null` when
+    // nothing better can be recovered.
+    refreshed.savingsMs = recomputed.savingsMs;
+  }
+  if (!known(insight.savingsBytes)) {
+    refreshed.savingsBytes = recomputed.savingsBytes;
+  }
+  // The source is only known when this function supplied the value; a stored
+  // figure keeps whatever provenance it was written with.
+  if (refreshed.savingsMs !== insight.savingsMs || refreshed.savingsBytes !== insight.savingsBytes) {
+    refreshed.savingsSource = recomputed.savingsSource;
+  }
+  return refreshed;
 }
 
 /**
