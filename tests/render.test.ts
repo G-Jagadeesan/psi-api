@@ -1,7 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import {
   ABSENT,
-  barSegments,
   colorEnabled,
   deviceLabel,
   environmentLine,
@@ -171,54 +170,6 @@ describe('renderTable', () => {
   });
 });
 
-describe('barSegments', () => {
-  const render = (value: number, target: number, scale: number, width = 12): string => {
-    const bar = barSegments(value, target, scale, width);
-    return bar.fill + bar.lead + bar.tick + bar.rest;
-  };
-
-  it('always draws exactly the requested number of cells', () => {
-    // A ragged right edge is the most visible way for a table to look broken.
-    for (const value of [0, 1, 118, 150, 1800, 2154, 3400, 99999]) {
-      for (const target of [0, 0.1, 200, 1800, 2500, 99999]) {
-        for (const scale of [1, 3400, 2154]) {
-          expect(visibleLength(render(value, target, scale))).toBe(12);
-        }
-      }
-    }
-  });
-
-  it('draws the marker past the fill when the value is under budget', () => {
-    const bar = render(2401, 2500, 3400);
-    // Filled up to the marker, then the marker, then headroom as empty cells.
-    expect(bar).toBe(`${'█'.repeat(8)}┃${'·'.repeat(3)}`);
-  });
-
-  it('puts the marker inside the fill when the value is over budget', () => {
-    const bar = render(2154, 1800, 3400);
-    // The marker sits on the fill rather than behind it, which is what makes an
-    // over-budget bar legible at a glance.
-    expect(bar).toBe(`${'█'.repeat(6)}█┃${'·'.repeat(4)}`);
-    expect(barSegments(2154, 1800, 3400).over).toBe(true);
-  });
-
-  it('marks an empty value at the budget position, not at the start', () => {
-    // TBT at 118ms against a 200ms budget: the bar is nearly empty, and a marker
-    // pinned to the left edge would read as "at the limit".
-    const bar = render(118, 200, 3400);
-    expect(bar).toBe(`┃${'·'.repeat(11)}`);
-  });
-
-  it('pins the marker to the end when the budget is off the scale', () => {
-    const bar = barSegments(118, 200, 100, 12);
-    expect(bar.tick).toBe('┃');
-    expect(visibleLength(bar.fill + bar.lead + bar.tick + bar.rest)).toBe(12);
-  });
-
-  it('survives a zero or negative scale', () => {
-    expect(visibleLength(render(5, 10, 0))).toBe(12);
-  });
-});
 
 describe('metricValue', () => {
   it('uses each metric own unit', () => {

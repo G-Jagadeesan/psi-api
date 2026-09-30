@@ -12,7 +12,7 @@ import { UrlValidationError } from './psiClient.js';
 import {
   ABSENT,
   METRIC_ROWS,
-  barSegments,
+  targetBar,
   colorEnabled,
   environmentLine,
   fit,
@@ -507,19 +507,19 @@ const BUDGET_COLUMNS: Column[] = [
   { key: 'metric', label: 'METRIC', min: 11 },
   { key: 'actual', label: 'MEDIAN', align: 'right', min: 8 },
   { key: 'target', label: 'TARGET', align: 'right', min: 8 },
+  { key: 'used', label: 'OF TARGET', align: 'right', min: 10 },
   { key: 'delta', label: 'VERDICT', min: 13 },
   { key: 'pass', label: 'RUNS IN TARGET', align: 'right', min: 15 },
-  { key: 'bar', label: '', min: 12, max: 12 },
+  { key: 'bar', label: '', min: 16, max: 16 },
 ];
 
 /**
- * The metric table: every graded metric, its median, its budget, and how often
- * real runs actually held it.
+ * The metric table: every graded metric, its median, its target, how much of
+ * that target it has consumed, and how often real runs actually held it.
  *
- * All rows share one bar scale, taken from the largest value in the table, so a
- * longer bar really is a worse metric. A bar scaled per row would make a 0.002
- * CLS and a 3.4s speed index look identical, which is the exact confusion the
- * table exists to prevent.
+ * The bar is drawn on share-of-target, not on the raw value, so every row means
+ * the same thing and the target sits in the same column on all of them. See
+ * `targetBar` for why the raw-value version was worse than no bar at all.
  */
 function metricsTable(report: AggregatedReport, useColor: boolean): string[] {
   const rows = METRIC_ROWS.filter((row) => report.headline.metrics[row.key] !== undefined);
@@ -527,14 +527,9 @@ function metricsTable(report: AggregatedReport, useColor: boolean): string[] {
 
   const byMetric = new Map(report.targets.gaps.map((gap) => [gap.metric, gap]));
   const entries = rows.map((row) => ({ ...row, gap: byMetric.get(row.key) }));
-  const scale = Math.max(
-    ...entries.map((entry) => Math.max(entry.gap?.actual ?? 0, entry.gap?.target ?? 0)),
-    1,
-  );
 
-  const columns: Column[] = BUDGET_COLUMNS;
-
-  return renderTable(columns, budgetCells(entries, scale, useColor), {    width: termWidth() - INDENT.length,
+  return renderTable(BUDGET_COLUMNS, budgetCells(entries, useColor), {
+    width: termWidth() - INDENT.length,
     gap: GAP,
     indent: INDENT,
     styleLabel: (text) => paint('dim', text, useColor),
@@ -545,21 +540,20 @@ function metricsTable(report: AggregatedReport, useColor: boolean): string[] {
  * One row per metric, for both the default view and `--diagnose`.
  *
  * Shared deliberately: the two views answer different questions but grade the
- * same budgets, and a reader who switches between them should not have to
+ * same targets, and a reader who switches between them should not have to
  * re-learn what the columns mean or re-read a differently-scaled bar.
  */
 function budgetCells(
   entries: Array<{ key: MetricKey; label: string; gap: Gap | undefined; actual?: number }>,
-  scale: number,
   useColor: boolean,
 ): string[][] {
   return entries.map((entry) => {
     const gap = entry.gap;
     const actual = entry.actual ?? gap?.actual ?? 0;
     const target = gap?.target ?? 0;
-    const bar = barSegments(actual, target, scale);
-    // One decision, reused by the bar, the label and the verdict text, so they
-    // cannot disagree with each other.
+    const bar = targetBar(actual, target);
+    // One decision, reused by the bar, the label, the percentage and the verdict
+    // text, so they cannot disagree with each other.
     const over = medianOverTarget(gap);
     const barText =
       paint(over ? 'red' : 'green', bar.fill + bar.lead, useColor) +
@@ -571,6 +565,9 @@ function budgetCells(
       over ? paint('red', entry.label, useColor) : entry.label,
       metricValue(entry.key, actual),
       gap ? metricValue(entry.key, gap.target) : ABSENT,
+      // The share is the number the bar is drawn from, so it is printed rather
+      // than left for the reader to infer from block characters.
+      gap ? paint(over ? 'red' : 'dim', `${Math.round(bar.used * 100)}%`, useColor) : ABSENT,
       gap ? paint(over ? 'red' : 'green', metricDelta(entry.key, gap.delta), useColor) : ABSENT,
       gap ? paint(passSeverity(gap), passCount(gap), useColor) : ABSENT,
       barText,
@@ -741,17 +738,13 @@ function renderDiagnosis(report: AggregatedReport, options: CliOptions): string 
   if (diagnosis.priorityOrder.length === 0) {
     lines.push(paint('green', `${INDENT}every measured metric is inside its target`, useColor));
   } else {
-    const scale = Math.max(
-      ...diagnosis.priorityOrder.map((gap) => Math.max(gap.actual, gap.target)),
-      1,
-    );
     const entries = diagnosis.priorityOrder.map((gap) => ({
       key: gap.metric as MetricKey,
       label: METRIC_LABELS[gap.metric] ?? gap.metric.toUpperCase(),
       gap,
     }));
     lines.push(
-      ...renderTable(BUDGET_COLUMNS, budgetCells(entries, scale, useColor), {
+      ...renderTable(BUDGET_COLUMNS, budgetCells(entries, useColor), {
         width: termWidth() - INDENT.length,
         gap: GAP,
         indent: INDENT,

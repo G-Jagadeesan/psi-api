@@ -329,68 +329,105 @@ function clampWidth(width: number, column: Partial<Column>): number {
 /* ----------------------------------- bars ----------------------------------- */
 
 export interface BarSegments {
-  /** The part of the bar the measured value covers, up to the budget marker. */
+  /** The part of the bar the measured value covers, up to the target marker. */
   fill: string;
-  /** Unfilled cells between the value and the budget, when the value is under it. */
+  /** Unfilled cells between the value and the target, when the value is under it. */
   lead: string;
-  /** The budget marker's single cell. */
+  /**
+   * The target marker, at the position of the target.
+   *
+   * Changes glyph when the target is breached, so the two states stay
+   * distinguishable without colour. A report pasted into an issue, or read
+   * through a pipe that strips ANSI, loses every other signal this bar carries.
+   */
   tick: string;
   /** The unused remainder, after the marker. */
   rest: string;
-  /** Whether the value runs past the budget. */
+  /** Whether the value runs past the target. */
   over: boolean;
+  /** Share of the target consumed, 1 = exactly at target. */
+  used: number;
 }
 
-/**
- * A value against a budget, drawn on a scale shared with its neighbours.
- *
- * `scale` is passed in rather than derived, and that is the whole point: a bar
- * scaled to its own row makes every row look equally bad, so the caller takes
- * the largest value in the table and every row is read against the same ruler.
- *
- * The marker is what makes the bar a judgement rather than a picture. Fill alone
- * only says "this metric is large", and TBT is small *and* fine. A filled bar
- * that stops before the marker is in budget; one that runs past it is not. The
- * marker is therefore a separate segment rather than a character inside the
- * fill, because when the value is over budget it has to overwrite the fill
- * instead of hiding behind it.
- */
-export function barSegments(
-  value: number,
-  target: number,
-  scale: number,
-  width = 12,
-): BarSegments {
-  const safeScale = scale > 0 ? scale : 1;
-  const cells = Math.max(1, width);
-  // How many cells the value covers, as a whole number of cells.
-  const covered = Math.round(clamp(value / safeScale, 0, 1) * cells);
-  // A budget beyond the scale still needs a mark, so the marker pins to the end
-  // rather than disappearing off the right edge.
-  const mark = Math.min(cells - 1, Math.floor(clamp(target / safeScale, 0, 1) * cells));
+/** Width of the drawn bar, in cells. */
+const BAR_CELLS = 16;
 
-  // The marker occupies one of the `cells` positions, so the value gets the
-  // other `cells - 1`. When the value runs past the marker that means one fewer
+/**
+ * The far end of every bar, as a multiple of the target.
+ *
+ * Fixed rather than derived from the data on purpose. A scale that stretches to
+ * fit the worst row in the table moves the marker to a different column on every
+ * report, so the one thing worth doing with this bar - scanning the column to
+ * see which rows reach the line - stops working. 200% is a natural ceiling for a
+ * performance target and leaves room for a genuinely bad row to be bad
+ * *visibly*; anything past it is clamped, and the VERDICT column carries the
+ * exact overshoot.
+ */
+const BAR_SCALE = 2;
+
+/**
+ * A metric's consumption of its own target, drawn against a fixed ruler.
+ *
+ * The bar is scaled to **share of target**, not to the raw value, and that is the
+ * whole fix. Raw values are not comparable across rows: CLS lives between 0 and
+ * 0.1 while FCP lives between 1800 and 2000, so on a shared raw scale the two
+ * best metrics on a page draw the shortest bars and read as the worst. Scaling
+ * by `actual / target` is dimensionless, which makes every row mean the same
+ * thing, and puts the target at the same column on every row so the eye can scan
+ * for who reaches the line.
+ *
+ * It also stops the bar re-stating the MEDIAN column, which is what a raw-value
+ * bar did: 0.6% over target and 12% over target both looked the same, because
+ * both were "the longest bar in the table".
+ */
+export function targetBar(
+  actual: number,
+  target: number,
+  cells = BAR_CELLS,
+  scale = BAR_SCALE,
+): BarSegments {
+  const width = Math.max(1, cells);
+  const safeTarget = Number.isFinite(target) && target > 0 ? target : 0;
+  // A zero or absent target gives nothing to measure against, so the bar stays
+  // empty and the marker is omitted rather than drawn at a meaningless position.
+  const used = safeTarget > 0 ? (Number.isFinite(actual) ? actual / safeTarget : 0) : 0;
+  if (safeTarget <= 0) {
+    return { fill: '', lead: '', tick: '', rest: '·'.repeat(width), over: false, used: 0 };
+  }
+
+  const mark = Math.min(width - 1, Math.floor((1 / scale) * width));
+  const covered = Math.round(clamp(used / scale, 0, 1) * width);
+  const over = used > 1;
+
+  // The marker occupies one of the `width` positions, so the value gets the
+  // other `width - 1`. When the value runs past the marker that means one fewer
   // filled cell than its own length - the marker sits *on top of* the fill rather
-  // than beside it, which is the whole visual point of an over-budget bar.
+  // than beside it, which is the whole visual point of an over-target bar.
   if (covered > mark) {
     return {
       fill: '█'.repeat(mark),
       lead: '█'.repeat(covered - mark - 1),
-      tick: '┃',
-      rest: '·'.repeat(cells - covered),
+      tick: BREACHED,
+      rest: '·'.repeat(width - covered),
       over: true,
+      used,
     };
   }
   return {
     fill: '█'.repeat(covered),
-    // The value is under budget: the gap between it and the marker is headroom.
+    // Under target: the gap between the value and the marker is headroom.
     lead: '·'.repeat(mark - covered),
-    tick: '┃',
-    rest: '·'.repeat(cells - mark - 1),
+    tick: TARGET_LINE,
+    rest: '·'.repeat(width - mark - 1),
     over: false,
+    used,
   };
 }
+
+/** The target, not yet reached: a limit the value is still inside. */
+const TARGET_LINE = '┃';
+/** The target, passed: an X on the line. Latin-1, so it is one column wide. */
+const BREACHED = '×';
 
 function clamp(value: number, low: number, high: number): number {
   return Math.max(low, Math.min(high, value));
