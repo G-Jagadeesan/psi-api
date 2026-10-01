@@ -4,7 +4,7 @@ This guide is for an **autonomous agent** driving a page toward a performance ta
 
 Read it end to end before your first run. The short version:
 
-> Measure with 10 runs. Pick the biggest failing insight. **Read `../sop-qwik.md` and obey it.** Make one small change. Open the page's staging PR, then wait 10 minutes and poll that PR every minute until the deploy settles — PSI measures a live public URL, so an undeployed change is not measurable. Measure again. Keep it only if the improvement beats the noise. Otherwise revert.
+> Measure with 10 runs. Pick the biggest failing insight. **Read `sop-qwik.md` and obey it.** Make one small change. Open the page's staging PR, then wait 10 minutes and poll that PR every minute until the deploy settles — PSI measures a live public URL, so an undeployed change is not measurable. Measure again. Keep it only if the improvement beats the noise. Otherwise revert.
 
 The tool is read-only to you. You use it; you do not modify it.
 
